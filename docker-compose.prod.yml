@@ -1,0 +1,94 @@
+services:
+  postgres:
+    image: postgres:16-alpine
+    container_name: walli-postgres
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER:-walli}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-walli}
+      POSTGRES_DB: ${POSTGRES_DB:-walli}
+    volumes:
+      - walli_postgres_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-walli}"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+  redis:
+    image: redis:7-alpine
+    container_name: walli-redis
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+  backend:
+    image: ghcr.io/jesusmartinjuan-droid/walli-backend:latest
+    container_name: walli-backend
+    restart: unless-stopped
+    env_file:
+      - .env
+    environment:
+      DATABASE_URL: ${DATABASE_URL}
+    volumes:
+      - walli_documents:/app/storage/documents
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    command: uvicorn app.main:app --host 0.0.0.0 --port 8000
+
+  worker:
+    image: ghcr.io/jesusmartinjuan-droid/walli-backend:latest
+    container_name: walli-worker
+    restart: unless-stopped
+    env_file:
+      - .env
+    volumes:
+      - walli_documents:/app/storage/documents
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    command: celery -A app.workers.celery_app worker --loglevel=info
+
+  scheduler:
+    image: ghcr.io/jesusmartinjuan-droid/walli-backend:latest
+    container_name: walli-scheduler
+    restart: unless-stopped
+    env_file:
+      - .env
+    volumes:
+      - walli_documents:/app/storage/documents
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    command: celery -A app.workers.celery_app beat --loglevel=info
+
+  frontend:
+    image: ghcr.io/jesusmartinjuan-droid/walli-frontend:latest
+    container_name: walli-frontend
+    restart: unless-stopped
+    environment:
+      DOMAIN: ${DOMAIN}
+    ports:
+      - "80:80"
+      - "443:443"
+    volumes:
+      - caddy_data:/data
+      - caddy_config:/config
+    depends_on:
+      - backend
+
+volumes:
+  walli_postgres_data:
+  walli_documents:
+  caddy_data:
+  caddy_config:
