@@ -4,7 +4,9 @@ Polling (`poll_mailbox`) is the entry point the worker calls once per minute
 per active mailbox: it downloads new messages via the appropriate
 `EmailProvider` and persists them as `EmailMessage`/`EmailThread` rows,
 de-duplicating via the unique (mailbox_id, imap_uid) and
-(mailbox_id, external_message_id) constraints.
+(mailbox_id, external_message_id) constraints. The very first poll for a
+mailbox only records `initial_sync_uid` (the current highest UID) and fetches
+nothing, so a newly connected mailbox never imports its pre-existing history.
 """
 
 from datetime import UTC, datetime
@@ -104,9 +106,30 @@ class MailboxService:
         created `EmailMessage` rows (ready to be handed to ProcessingService)."""
         provider = build_email_provider(mailbox, self.decrypt_password(mailbox))
 
+        if mailbox.initial_sync_uid is None:
+            # First poll for this mailbox: only record the current highest UID
+            # as the sync baseline, don't import anything yet. This is what
+            # keeps a newly connected mailbox from dumping its entire history
+            # into Walli — from the next poll onward we only fetch UIDs past
+            # this point.
+            try:
+                mailbox.initial_sync_uid = provider.get_latest_uid()
+            except Exception as exc:
+                logger.error("mailbox_initial_sync_baseline_failed mailbox_id=%s error=%s", mailbox.id, exc)
+                raise
+            finally:
+                mailbox.last_checked_at = datetime.now(UTC)
+                self.repo.commit()
+            logger.info(
+                "mailbox_initial_sync_baseline_set mailbox_id=%s uid=%s", mailbox.id, mailbox.initial_sync_uid
+            )
+            return []
+
         known_uids = self._known_uids(mailbox.id)
         try:
-            fetched_emails = provider.fetch_new_emails(known_uids, max_emails)
+            fetched_emails = provider.fetch_new_emails(
+                known_uids, max_emails, min_uid=mailbox.initial_sync_uid + 1
+            )
         except Exception as exc:
             logger.error("mailbox_poll_imap_error mailbox_id=%s error=%s", mailbox.id, exc)
             raise

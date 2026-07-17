@@ -41,6 +41,11 @@ class Mailbox(Base, TimestampMixin):
 
     is_active: Mapped[bool] = mapped_column(Boolean, default=True, nullable=False)
     last_checked_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    # UID (IMAP) más alto que ya existía en el buzón cuando se sincronizó por
+    # primera vez. Se fija una sola vez, en el primer poll, y de ahí en
+    # adelante solo se descargan correos con UID posterior — así nunca se
+    # importa el histórico de un buzón recién conectado.
+    initial_sync_uid: Mapped[int | None] = mapped_column(Integer, nullable=True)
 
     threads: Mapped[list["EmailThread"]] = relationship(back_populates="mailbox")
     messages: Mapped[list["EmailMessage"]] = relationship(back_populates="mailbox")

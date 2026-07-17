@@ -14,11 +14,37 @@ from app.services.email_provider_service import (
 
 
 class _FakeImapConnection:
-    def __init__(self, *args, **kwargs):
+    def __init__(
+        self,
+        *args,
+        uidnext: int = 1,
+        search_uids: list[int] | None = None,
+        messages: dict[int, bytes] | None = None,
+        **kwargs,
+    ):
         self.appended_message: bytes | None = None
+        self.uidnext = uidnext
+        self.search_uids = search_uids or []
+        self.messages = messages or {}
+        self.search_calls: list[tuple] = []
 
     def login(self, username, password):
         return "OK", [b"Logged in"]
+
+    def select(self, folder, readonly=False):
+        return "OK", [b"1"]
+
+    def status(self, folder, what):
+        return "OK", [f'"{folder}" (UIDNEXT {self.uidnext})'.encode()]
+
+    def uid(self, command, *args):
+        if command == "search":
+            self.search_calls.append(args)
+            return "OK", [" ".join(str(uid) for uid in self.search_uids).encode()]
+        if command == "fetch":
+            uid = int(args[0])
+            return "OK", [(b"1 (RFC822 {0}", self.messages[uid])]
+        raise AssertionError(f"unexpected uid command: {command}")
 
     def append(self, folder, flags, date, message_bytes):
         self.appended_message = message_bytes
@@ -26,6 +52,18 @@ class _FakeImapConnection:
 
     def logout(self):
         return "BYE", [b"Logging out"]
+
+
+def _raw_email_bytes(uid: int) -> bytes:
+    return (
+        f"From: cliente@example.com\r\n"
+        f"To: soporte@lawall.local\r\n"
+        f"Subject: Consulta {uid}\r\n"
+        f"Message-ID: <msg-{uid}@example.com>\r\n"
+        f"Date: Mon, 1 Jan 2026 10:00:00 +0000\r\n"
+        f"\r\n"
+        f"Hola\r\n"
+    ).encode()
 
 
 def _make_provider(monkeypatch, fake_connection: _FakeImapConnection) -> ImapEmailProvider:
@@ -143,3 +181,39 @@ def test_create_draft_uses_placeholder_when_original_has_no_text_body(monkeypatc
 
     assert "Correo original sin contenido de texto" in body_text
     assert "Correo original sin contenido de texto" in body_html
+
+
+def test_get_latest_uid_returns_uidnext_minus_one(monkeypatch):
+    fake_connection = _FakeImapConnection(uidnext=43)
+    provider = _make_provider(monkeypatch, fake_connection)
+
+    assert provider.get_latest_uid() == 42
+
+
+def test_get_latest_uid_returns_zero_for_empty_mailbox(monkeypatch):
+    fake_connection = _FakeImapConnection(uidnext=1)
+    provider = _make_provider(monkeypatch, fake_connection)
+
+    assert provider.get_latest_uid() == 0
+
+
+def test_fetch_new_emails_without_min_uid_searches_all(monkeypatch):
+    fake_connection = _FakeImapConnection(
+        search_uids=[1, 2], messages={1: _raw_email_bytes(1), 2: _raw_email_bytes(2)}
+    )
+    provider = _make_provider(monkeypatch, fake_connection)
+
+    results = provider.fetch_new_emails(known_uids=set(), max_emails=20)
+
+    assert [r.imap_uid for r in results] == [1, 2]
+    assert fake_connection.search_calls == [(None, "ALL")]
+
+
+def test_fetch_new_emails_with_min_uid_searches_uid_range(monkeypatch):
+    fake_connection = _FakeImapConnection(search_uids=[43], messages={43: _raw_email_bytes(43)})
+    provider = _make_provider(monkeypatch, fake_connection)
+
+    results = provider.fetch_new_emails(known_uids=set(), max_emails=20, min_uid=43)
+
+    assert [r.imap_uid for r in results] == [43]
+    assert fake_connection.search_calls == [(None, "UID", "43:*")]

@@ -20,6 +20,7 @@ from __future__ import annotations
 import email as email_lib
 import html as html_lib
 import imaplib
+import re
 from abc import ABC, abstractmethod
 from dataclasses import dataclass, field
 from datetime import datetime
@@ -82,8 +83,15 @@ class EmailProvider(ABC):
     def test_connection(self) -> tuple[bool, str]: ...
 
     @abstractmethod
-    def fetch_new_emails(self, known_uids: set[int], max_emails: int) -> list[FetchedEmail]:
-        """Return up to `max_emails` messages from the inbox whose UID is not in `known_uids`."""
+    def fetch_new_emails(self, known_uids: set[int], max_emails: int, min_uid: int = 1) -> list[FetchedEmail]:
+        """Return up to `max_emails` messages from the inbox whose UID is not in
+        `known_uids` and is >= `min_uid` (used to skip a mailbox's pre-existing
+        history — see `MailboxService.poll_mailbox`)."""
+
+    @abstractmethod
+    def get_latest_uid(self) -> int:
+        """Return the highest UID currently in the inbox (0 if empty), used to
+        establish the baseline for a newly connected mailbox."""
 
     @abstractmethod
     def create_draft(self, *, subject: str, body: str, in_reply_to: FetchedEmail) -> DraftCreationResult:
@@ -110,7 +118,9 @@ def _build_reply_bodies(*, generated_reply: str, original: FetchedEmail) -> tupl
         quoted_html = html_lib.escape(original.body_text).replace("\n", "<br>")
     else:
         quoted_html = html_lib.escape(_NO_TEXT_BODY_PLACEHOLDER)
-    html_body = f"<p>{reply_html}</p><p>{html_lib.escape(attribution)}</p><blockquote>{quoted_html}</blockquote>"
+    html_body = (
+        f"<p>{reply_html}</p><p>{html_lib.escape(attribution)}</p><blockquote>{quoted_html}</blockquote>"
+    )
 
     return plain_body, html_body
 
@@ -155,11 +165,14 @@ class ImapEmailProvider(EmailProvider):
             logger.warning("imap_test_connection_failed host=%s error=%s", self.credentials.host, exc)
             return False, f"Could not connect: {exc}"
 
-    def fetch_new_emails(self, known_uids: set[int], max_emails: int) -> list[FetchedEmail]:
+    def fetch_new_emails(self, known_uids: set[int], max_emails: int, min_uid: int = 1) -> list[FetchedEmail]:
         conn = with_retry(self._connect, exceptions=(OSError, imaplib.IMAP4.error))
         try:
             conn.select(self.credentials.inbox_folder, readonly=True)
-            status, data = conn.uid("search", None, "ALL")
+            if min_uid > 1:
+                status, data = conn.uid("search", None, "UID", f"{min_uid}:*")
+            else:
+                status, data = conn.uid("search", None, "ALL")
             if status != "OK":
                 raise EmailProviderError(f"IMAP search failed: {status}")
 
@@ -174,6 +187,22 @@ class ImapEmailProvider(EmailProvider):
                 if fetched:
                     results.append(fetched)
             return results
+        finally:
+            try:
+                conn.logout()
+            except Exception:
+                pass
+
+    def get_latest_uid(self) -> int:
+        conn = with_retry(self._connect, exceptions=(OSError, imaplib.IMAP4.error))
+        try:
+            status, data = conn.status(self.credentials.inbox_folder, "(UIDNEXT)")
+            if status != "OK" or not data or data[0] is None:
+                raise EmailProviderError(f"IMAP status failed: {status}")
+            match = re.search(rb"UIDNEXT (\d+)", data[0])
+            if not match:
+                raise EmailProviderError(f"Could not parse UIDNEXT from: {data[0]!r}")
+            return max(int(match.group(1)) - 1, 0)
         finally:
             try:
                 conn.logout()

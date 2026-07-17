@@ -191,6 +191,8 @@ Cada `MAIL_POLL_INTERVAL_SECONDS` (60s por defecto), Celery Beat dispara la tare
 2. Para cada uno, se conecta por IMAP y descarga hasta `MAX_EMAILS_PER_RUN` correos nuevos (los que no tengan ya un UID o Message-ID registrado en base de datos — así se evita procesar el mismo correo dos veces).
 3. Cada correo nuevo se guarda como `EmailMessage` (y se agrupa en un `EmailThread` si el hilo ya existe) y se encola como una tarea `process_email` independiente.
 
+**Un buzón recién conectado no importa su histórico.** El primer poll tras crear o activar un buzón solo guarda el UID más alto que ya existía en ese momento (`Mailbox.initial_sync_uid`) y no descarga nada; a partir del siguiente ciclo, solo se traen correos con UID posterior a ese punto. Así, conectar un buzón con cientos de correos antiguos no genera un borrador (ni gasta LLM) por cada uno de ellos — solo se procesan los que lleguen de verdad a partir de la conexión.
+
 `process_email` (por correo):
 
 1. Carga el prompt activo y los documentos activos.
