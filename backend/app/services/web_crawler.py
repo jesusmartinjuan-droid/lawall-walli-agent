@@ -57,6 +57,11 @@ _NOISE_CONTAINER_CANDIDATE_TAGS = ("div", "section")
 # entirely instead of trying to blocklist them one by one.
 _MAIN_CONTENT_SELECTORS = ("main", "[role='main']", "article")
 
+# Matches any docs.google.com/document/d/{ID} URL, with or without a trailing
+# /edit, view params, etc. A Google Doc shared as "anyone with the link" can
+# be exported as plain text without authentication (see _fetch_google_doc).
+_GOOGLE_DOCS_PATTERN = re.compile(r"docs\.google\.com/document/d/([a-zA-Z0-9_-]+)")
+
 
 def _looks_like_noise_container(tag) -> bool:
     css_classes = tag.get("class") or []
@@ -142,14 +147,56 @@ def _extract_visible_text(html: str) -> tuple[str, list[str], bool]:
     return text, links, keep_language
 
 
+def _fetch_google_doc(doc_url: str, doc_id: str, client: httpx.Client) -> CrawlResult:
+    """Download a Google Doc shared as "anyone with the link" via its plain-text
+    export endpoint. If the doc isn't actually public, Google responds with an
+    HTML sign-in page instead (still HTTP 200), which is distinguished here by
+    content-type rather than status code."""
+    export_url = f"https://docs.google.com/document/d/{doc_id}/export?format=txt"
+    try:
+        response = client.get(export_url)
+        response.raise_for_status()
+    except httpx.HTTPError as exc:
+        logger.warning("google_doc_fetch_failed doc_url=%s error=%s", doc_url, exc)
+        return CrawlResult(
+            pages_crawled=0, extracted_text="", error=f"No se pudo descargar el documento: {exc}"
+        )
+
+    content_type = response.headers.get("content-type", "")
+    if "text/plain" not in content_type:
+        return CrawlResult(
+            pages_crawled=0,
+            extracted_text="",
+            error=(
+                "El documento no es accesible. Comprueba que esté compartido como "
+                "'Cualquiera con el enlace puede ver'."
+            ),
+        )
+
+    text = response.text[:MAX_STORED_TEXT_CHARS]
+    return CrawlResult(pages_crawled=1, extracted_text=text, error=None, visited_urls=[doc_url])
+
+
 def crawl_site(root_url: str, max_pages: int, *, client: httpx.Client | None = None) -> CrawlResult:
     """BFS from `root_url`, same-domain only, up to `max_pages`. Never raises:
     all failures are captured into `CrawlResult.error`, mirroring
-    MailboxService.test_connection's best-effort style."""
-    root_netloc = urlparse(root_url).netloc
+    MailboxService.test_connection's best-effort style.
+
+    If `root_url` is a Google Docs link, delegates to `_fetch_google_doc`
+    instead of crawling HTML — `max_pages` doesn't apply to a single document.
+    """
     owns_client = client is None
     client = client or httpx.Client(timeout=REQUEST_TIMEOUT_SECONDS, follow_redirects=True)
 
+    google_doc_match = _GOOGLE_DOCS_PATTERN.search(root_url)
+    if google_doc_match:
+        try:
+            return _fetch_google_doc(root_url, google_doc_match.group(1), client)
+        finally:
+            if owns_client:
+                client.close()
+
+    root_netloc = urlparse(root_url).netloc
     queue: list[str] = [root_url]
     seen: set[str] = {root_url}
     sections: list[str] = []

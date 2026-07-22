@@ -164,7 +164,9 @@ export default function DocumentsPage() {
           <h2 style={{ marginTop: 0 }}>Sitios web</h2>
           <p className="page-subtitle">
             Añade la web de la empresa para que el agente también use su contenido como contexto. Se
-            rastrean las páginas internas del mismo dominio y se actualizan periódicamente.
+            rastrean las páginas internas del mismo dominio y se actualizan periódicamente. También
+            admite enlaces de Google Docs, siempre que el documento esté compartido como "cualquiera
+            con el enlace puede ver": su contenido se mantiene sincronizado en cada actualización.
           </p>
         </div>
         {!showWebSourceForm && (
@@ -193,7 +195,7 @@ export default function DocumentsPage() {
               <input
                 id="web-source-url"
                 type="text"
-                placeholder="https://la-wall.com/"
+                placeholder="https://la-wall.com/ o un enlace de Google Docs"
                 value={webSourceForm.root_url}
                 onChange={(e) => setWebSourceForm({ ...webSourceForm, root_url: e.target.value })}
                 required
@@ -211,6 +213,9 @@ export default function DocumentsPage() {
                 }
                 required
               />
+              <span style={{ fontSize: 12, color: "var(--color-muted)" }}>
+                No aplica a enlaces de Google Docs.
+              </span>
             </div>
           </div>
           <div className="btn-row">
