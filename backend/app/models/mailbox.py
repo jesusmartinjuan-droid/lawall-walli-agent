@@ -1,7 +1,7 @@
 from datetime import datetime
 from typing import TYPE_CHECKING
 
-from sqlalchemy import Boolean, DateTime, Enum, Integer, String
+from sqlalchemy import Boolean, DateTime, Enum, Integer, String, Text
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 
 from app.db.base import Base, TimestampMixin
@@ -46,6 +46,11 @@ class Mailbox(Base, TimestampMixin):
     # adelante solo se descargan correos con UID posterior — así nunca se
     # importa el histórico de un buzón recién conectado.
     initial_sync_uid: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    # Error from the most recent poll attempt (IMAP connection/auth/etc.),
+    # cleared on the next successful poll. Surfaced in the frontend so a
+    # mailbox that's been failing silently is actually visible as failing —
+    # last_checked_at alone updates on both success and failure.
+    last_poll_error: Mapped[str | None] = mapped_column(Text, nullable=True)
 
     threads: Mapped[list["EmailThread"]] = relationship(back_populates="mailbox")
     messages: Mapped[list["EmailMessage"]] = relationship(back_populates="mailbox")

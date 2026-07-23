@@ -13,6 +13,7 @@ import {
 } from "../api/web-sources";
 import type { WebSourceFormValues } from "../types";
 import { formatDateTime } from "../utils/formatDate";
+import { getErrorMessage } from "../utils/getErrorMessage";
 
 const ACCEPTED_EXTENSIONS = ".txt,.md,.pdf,.docx,.xlsx";
 
@@ -56,6 +57,7 @@ export default function DocumentsPage() {
   });
   const [showWebSourceForm, setShowWebSourceForm] = useState(false);
   const [webSourceForm, setWebSourceForm] = useState<WebSourceFormValues>(EMPTY_WEB_SOURCE_FORM);
+  const [webSourceFormError, setWebSourceFormError] = useState<string | null>(null);
 
   const invalidateWebSources = () => queryClient.invalidateQueries({ queryKey: ["web-sources"] });
 
@@ -65,7 +67,10 @@ export default function DocumentsPage() {
       invalidateWebSources();
       setShowWebSourceForm(false);
       setWebSourceForm(EMPTY_WEB_SOURCE_FORM);
+      setWebSourceFormError(null);
     },
+    onError: (error) =>
+      setWebSourceFormError(getErrorMessage(error, "No se pudo crear la fuente web.")),
   });
   const deleteWebSourceMutation = useMutation({ mutationFn: deleteWebSource, onSuccess: invalidateWebSources });
   const activateWebSourceMutation = useMutation({
@@ -83,6 +88,7 @@ export default function DocumentsPage() {
 
   function handleWebSourceSubmit(event: FormEvent) {
     event.preventDefault();
+    setWebSourceFormError(null);
     createWebSourceMutation.mutate(webSourceForm);
   }
 
@@ -168,7 +174,14 @@ export default function DocumentsPage() {
           </p>
         </div>
         {!showWebSourceForm && (
-          <button type="button" className="btn btn-primary" onClick={() => setShowWebSourceForm(true)}>
+          <button
+            type="button"
+            className="btn btn-primary"
+            onClick={() => {
+              setWebSourceFormError(null);
+              setShowWebSourceForm(true);
+            }}
+          >
             Nueva fuente web
           </button>
         )}
@@ -213,6 +226,7 @@ export default function DocumentsPage() {
               />
             </div>
           </div>
+          {webSourceFormError && <p className="error-text">{webSourceFormError}</p>}
           <div className="btn-row">
             <button type="submit" className="btn btn-primary" disabled={createWebSourceMutation.isPending}>
               {createWebSourceMutation.isPending ? "Rastreando…" : "Guardar"}
@@ -223,6 +237,7 @@ export default function DocumentsPage() {
               onClick={() => {
                 setShowWebSourceForm(false);
                 setWebSourceForm(EMPTY_WEB_SOURCE_FORM);
+                setWebSourceFormError(null);
               }}
             >
               Cancelar

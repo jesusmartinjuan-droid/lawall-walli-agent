@@ -114,8 +114,10 @@ class MailboxService:
             # this point.
             try:
                 mailbox.initial_sync_uid = provider.get_latest_uid()
+                mailbox.last_poll_error = None
             except Exception as exc:
                 logger.error("mailbox_initial_sync_baseline_failed mailbox_id=%s error=%s", mailbox.id, exc)
+                mailbox.last_poll_error = str(exc)
                 raise
             finally:
                 mailbox.last_checked_at = datetime.now(UTC)
@@ -130,8 +132,10 @@ class MailboxService:
             fetched_emails = provider.fetch_new_emails(
                 known_uids, max_emails, min_uid=mailbox.initial_sync_uid + 1
             )
+            mailbox.last_poll_error = None
         except Exception as exc:
             logger.error("mailbox_poll_imap_error mailbox_id=%s error=%s", mailbox.id, exc)
+            mailbox.last_poll_error = str(exc)
             raise
         finally:
             mailbox.last_checked_at = datetime.now(UTC)

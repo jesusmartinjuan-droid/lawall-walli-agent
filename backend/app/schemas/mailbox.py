@@ -42,6 +42,7 @@ class MailboxResponse(MailboxBase):
     id: int
     is_active: bool
     last_checked_at: datetime | None
+    last_poll_error: str | None
     created_at: datetime
     updated_at: datetime
 

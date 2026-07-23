@@ -13,6 +13,7 @@ import {
 } from "../api/mailboxes";
 import type { Mailbox, MailboxFormValues } from "../types";
 import { formatDateTime } from "../utils/formatDate";
+import { getErrorMessage } from "../utils/getErrorMessage";
 
 const EMPTY_FORM: MailboxFormValues = {
   name: "",
@@ -35,6 +36,7 @@ export default function MailboxesPage() {
   const [showForm, setShowForm] = useState(false);
   const [form, setForm] = useState<MailboxFormValues>(EMPTY_FORM);
   const [testMessages, setTestMessages] = useState<Record<number, string>>({});
+  const [formError, setFormError] = useState<string | null>(null);
 
   const invalidate = () => queryClient.invalidateQueries({ queryKey: ["mailboxes"] });
 
@@ -44,6 +46,7 @@ export default function MailboxesPage() {
       invalidate();
       closeForm();
     },
+    onError: (error) => setFormError(getErrorMessage(error, "No se pudo crear el buzón.")),
   });
 
   const updateMutation = useMutation({
@@ -53,6 +56,7 @@ export default function MailboxesPage() {
       invalidate();
       closeForm();
     },
+    onError: (error) => setFormError(getErrorMessage(error, "No se pudo guardar el buzón.")),
   });
 
   const deleteMutation = useMutation({ mutationFn: deleteMailbox, onSuccess: invalidate });
@@ -69,6 +73,7 @@ export default function MailboxesPage() {
   function openCreateForm() {
     setEditingId(null);
     setForm(EMPTY_FORM);
+    setFormError(null);
     setShowForm(true);
   }
 
@@ -86,6 +91,7 @@ export default function MailboxesPage() {
       inbox_folder: mailbox.inbox_folder,
       drafts_folder: mailbox.drafts_folder,
     });
+    setFormError(null);
     setShowForm(true);
   }
 
@@ -93,10 +99,12 @@ export default function MailboxesPage() {
     setShowForm(false);
     setEditingId(null);
     setForm(EMPTY_FORM);
+    setFormError(null);
   }
 
   function handleSubmit(event: FormEvent) {
     event.preventDefault();
+    setFormError(null);
     if (editingId !== null) {
       const payload: Partial<MailboxFormValues> = { ...form };
       if (!payload.imap_password) delete payload.imap_password;
@@ -227,6 +235,7 @@ export default function MailboxesPage() {
               <label htmlFor="imap_use_ssl">Usar SSL</label>
             </div>
           </div>
+          {formError && <p className="error-text">{formError}</p>}
           <div className="btn-row">
             <button type="submit" className="btn btn-primary" disabled={isSaving}>
               {isSaving ? "Guardando…" : "Guardar"}
@@ -268,6 +277,11 @@ export default function MailboxesPage() {
                   <span className={`badge ${mailbox.is_active ? "tone-success" : "tone-neutral"}`}>
                     {mailbox.is_active ? "Activo" : "Inactivo"}
                   </span>
+                  {mailbox.last_poll_error && (
+                    <span className="badge tone-danger" style={{ marginLeft: 6 }}>
+                      Error de conexión
+                    </span>
+                  )}
                 </td>
                 <td>{formatDateTime(mailbox.last_checked_at)}</td>
                 <td>
@@ -314,6 +328,11 @@ export default function MailboxesPage() {
                   {testMessages[mailbox.id] && (
                     <p className="page-subtitle" style={{ marginTop: 6, fontSize: 12 }}>
                       {testMessages[mailbox.id]}
+                    </p>
+                  )}
+                  {mailbox.last_poll_error && (
+                    <p className="error-text" style={{ marginTop: 6, fontSize: 12 }}>
+                      Último sondeo fallido: {mailbox.last_poll_error}
                     </p>
                   )}
                 </td>

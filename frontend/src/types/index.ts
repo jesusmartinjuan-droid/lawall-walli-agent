@@ -23,6 +23,7 @@ export interface Mailbox {
   drafts_folder: string;
   is_active: boolean;
   last_checked_at: string | null;
+  last_poll_error: string | null;
   created_at: string;
   updated_at: string;
 }
