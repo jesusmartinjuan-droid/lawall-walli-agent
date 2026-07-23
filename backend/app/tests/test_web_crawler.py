@@ -304,3 +304,16 @@ def test_crawl_google_doc_not_shared_returns_error():
     assert result.extracted_text == ""
     assert result.error is not None
     assert "compartido" in result.error
+
+
+def test_crawl_rejects_non_document_google_url_without_crawling():
+    def handler(request: httpx.Request) -> httpx.Response:
+        raise AssertionError("must not make any HTTP request for a non-document Google URL")
+
+    client = httpx.Client(transport=httpx.MockTransport(handler))
+    result = crawl_site("https://docs.google.com/", max_pages=20, client=client)
+
+    assert result.pages_crawled == 0
+    assert result.extracted_text == ""
+    assert result.error is not None
+    assert "documento concreto" in result.error

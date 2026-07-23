@@ -196,6 +196,27 @@ def crawl_site(root_url: str, max_pages: int, *, client: httpx.Client | None = N
             if owns_client:
                 client.close()
 
+    root_netloc_check = urlparse(root_url).netloc
+    if root_netloc_check.endswith("google.com") and (
+        "docs.google.com" in root_netloc_check or "drive.google.com" in root_netloc_check
+    ):
+        # A Google Docs/Drive URL that isn't a specific document link (see
+        # _GOOGLE_DOCS_PATTERN above) — reject it explicitly instead of
+        # letting it fall through to the generic crawler, which would BFS
+        # Google's own public marketing site under that domain (this
+        # actually happened once against production).
+        if owns_client:
+            client.close()
+        return CrawlResult(
+            pages_crawled=0,
+            extracted_text="",
+            error=(
+                "Esa URL no es un documento concreto de Google Docs. Pega el enlace a un "
+                "documento (https://docs.google.com/document/d/ID/...), no la página general "
+                "de Google Docs o Drive."
+            ),
+        )
+
     root_netloc = urlparse(root_url).netloc
     queue: list[str] = [root_url]
     seen: set[str] = {root_url}
