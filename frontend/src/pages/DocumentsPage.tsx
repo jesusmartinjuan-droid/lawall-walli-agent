@@ -23,6 +23,17 @@ const EMPTY_WEB_SOURCE_FORM: WebSourceFormValues = {
   max_pages: 20,
 };
 
+const EMPTY_DRIVE_FORM = { name: "", root_url: "" };
+
+function isGoogleDocsSource(rootUrl: string): boolean {
+  try {
+    const host = new URL(rootUrl).hostname;
+    return host === "docs.google.com" || host === "drive.google.com";
+  } catch {
+    return false;
+  }
+}
+
 export default function DocumentsPage() {
   const queryClient = useQueryClient();
   const { data: documents, isLoading } = useQuery({ queryKey: ["documents"], queryFn: listDocuments });
@@ -90,6 +101,32 @@ export default function DocumentsPage() {
     event.preventDefault();
     setWebSourceFormError(null);
     createWebSourceMutation.mutate(webSourceForm);
+  }
+
+  const regularWebSources = webSources?.filter((source) => !isGoogleDocsSource(source.root_url));
+  const driveSources = webSources?.filter((source) => isGoogleDocsSource(source.root_url));
+
+  // --- Drive documents ----------------------------------------------------
+  const [showDriveForm, setShowDriveForm] = useState(false);
+  const [driveForm, setDriveForm] = useState(EMPTY_DRIVE_FORM);
+  const [driveFormError, setDriveFormError] = useState<string | null>(null);
+
+  const createDriveSourceMutation = useMutation({
+    mutationFn: createWebSource,
+    onSuccess: () => {
+      invalidateWebSources();
+      setShowDriveForm(false);
+      setDriveForm(EMPTY_DRIVE_FORM);
+      setDriveFormError(null);
+    },
+    onError: (error) =>
+      setDriveFormError(getErrorMessage(error, "No se pudo añadir el documento de Drive.")),
+  });
+
+  function handleDriveSubmit(event: FormEvent) {
+    event.preventDefault();
+    setDriveFormError(null);
+    createDriveSourceMutation.mutate({ ...driveForm, max_pages: 20 });
   }
 
   return (
@@ -170,9 +207,7 @@ export default function DocumentsPage() {
           <h2 style={{ marginTop: 0 }}>Sitios web</h2>
           <p className="page-subtitle">
             Añade la web de la empresa para que el agente también use su contenido como contexto. Se
-            rastrean las páginas internas del mismo dominio y se actualizan periódicamente. También
-            admite enlaces de Google Docs, siempre que el documento esté compartido como "cualquiera
-            con el enlace puede ver": su contenido se mantiene sincronizado en cada actualización.
+            rastrean las páginas internas del mismo dominio y se actualizan periódicamente.
           </p>
         </div>
         {!showWebSourceForm && (
@@ -208,7 +243,7 @@ export default function DocumentsPage() {
               <input
                 id="web-source-url"
                 type="text"
-                placeholder="https://la-wall.com/ o un enlace de Google Docs"
+                placeholder="https://la-wall.com/"
                 value={webSourceForm.root_url}
                 onChange={(e) => setWebSourceForm({ ...webSourceForm, root_url: e.target.value })}
                 required
@@ -226,9 +261,6 @@ export default function DocumentsPage() {
                 }
                 required
               />
-              <span style={{ fontSize: 12, color: "var(--color-muted)" }}>
-                No aplica a enlaces de Google Docs.
-              </span>
             </div>
           </div>
           {webSourceFormError && <p className="error-text">{webSourceFormError}</p>}
@@ -253,11 +285,11 @@ export default function DocumentsPage() {
 
       {isLoadingWebSources && <p>Cargando…</p>}
 
-      {webSources && webSources.length === 0 && !showWebSourceForm && (
+      {regularWebSources && regularWebSources.length === 0 && !showWebSourceForm && (
         <div className="empty-state">No hay ninguna web configurada todavía.</div>
       )}
 
-      {webSources && webSources.length > 0 && (
+      {regularWebSources && regularWebSources.length > 0 && (
         <table>
           <thead>
             <tr>
@@ -271,7 +303,7 @@ export default function DocumentsPage() {
             </tr>
           </thead>
           <tbody>
-            {webSources.map((source) => (
+            {regularWebSources.map((source) => (
               <tr key={source.id}>
                 <td>{source.name}</td>
                 <td>{source.root_url}</td>
@@ -314,6 +346,159 @@ export default function DocumentsPage() {
                       className="btn btn-small btn-danger"
                       onClick={() => {
                         if (confirm(`¿Eliminar la fuente web "${source.name}"?`)) {
+                          deleteWebSourceMutation.mutate(source.id);
+                        }
+                      }}
+                    >
+                      Eliminar
+                    </button>
+                  </div>
+                  {source.last_fetch_error && (
+                    <p className="error-text" style={{ marginTop: 6, fontSize: 12 }}>
+                      {source.last_fetch_error}
+                    </p>
+                  )}
+                </td>
+              </tr>
+            ))}
+          </tbody>
+        </table>
+      )}
+
+      <div className="page-header" style={{ marginTop: 40 }}>
+        <div>
+          <h2 style={{ marginTop: 0 }}>Documentos de Drive</h2>
+          <p className="page-subtitle">
+            Añade documentos de Google Docs para que el agente use su contenido como contexto. El
+            documento debe estar compartido como "Cualquiera con el enlace puede ver"; su contenido se
+            mantiene sincronizado en cada actualización periódica.
+          </p>
+        </div>
+        {!showDriveForm && (
+          <button
+            type="button"
+            className="btn btn-primary"
+            onClick={() => {
+              setDriveFormError(null);
+              setShowDriveForm(true);
+            }}
+          >
+            Nuevo documento de Drive
+          </button>
+        )}
+      </div>
+
+      {showDriveForm && (
+        <form className="card" style={{ marginBottom: 24 }} onSubmit={handleDriveSubmit}>
+          <h3 style={{ marginTop: 0 }}>Nuevo documento de Drive</h3>
+          <div className="form-grid">
+            <div className="form-field">
+              <label htmlFor="drive-source-name">Nombre</label>
+              <input
+                id="drive-source-name"
+                type="text"
+                value={driveForm.name}
+                onChange={(e) => setDriveForm({ ...driveForm, name: e.target.value })}
+                required
+              />
+            </div>
+            <div className="form-field">
+              <label htmlFor="drive-source-url">Enlace al documento</label>
+              <input
+                id="drive-source-url"
+                type="text"
+                placeholder="https://docs.google.com/document/d/..."
+                value={driveForm.root_url}
+                onChange={(e) => setDriveForm({ ...driveForm, root_url: e.target.value })}
+                required
+              />
+            </div>
+          </div>
+          {driveFormError && <p className="error-text">{driveFormError}</p>}
+          <div className="btn-row">
+            <button
+              type="submit"
+              className="btn btn-primary"
+              disabled={createDriveSourceMutation.isPending}
+            >
+              {createDriveSourceMutation.isPending ? "Descargando…" : "Guardar"}
+            </button>
+            <button
+              type="button"
+              className="btn btn-secondary"
+              onClick={() => {
+                setShowDriveForm(false);
+                setDriveForm(EMPTY_DRIVE_FORM);
+                setDriveFormError(null);
+              }}
+            >
+              Cancelar
+            </button>
+          </div>
+        </form>
+      )}
+
+      {isLoadingWebSources && <p>Cargando…</p>}
+
+      {driveSources && driveSources.length === 0 && !showDriveForm && (
+        <div className="empty-state">No hay documentos de Drive configurados todavía.</div>
+      )}
+
+      {driveSources && driveSources.length > 0 && (
+        <table>
+          <thead>
+            <tr>
+              <th>Nombre</th>
+              <th>Enlace</th>
+              <th>Texto extraído</th>
+              <th>Estado</th>
+              <th>Última actualización</th>
+              <th></th>
+            </tr>
+          </thead>
+          <tbody>
+            {driveSources.map((source) => (
+              <tr key={source.id}>
+                <td>{source.name}</td>
+                <td>{source.root_url}</td>
+                <td>{source.text_length.toLocaleString("es-ES")} caracteres</td>
+                <td>
+                  <span className={`badge ${source.is_active ? "tone-success" : "tone-neutral"}`}>
+                    {source.is_active ? "Activo" : "Inactivo"}
+                  </span>
+                </td>
+                <td>{formatDateTime(source.last_fetched_at)}</td>
+                <td>
+                  <div className="btn-row">
+                    <button
+                      type="button"
+                      className="btn btn-small"
+                      onClick={() => refreshWebSourceMutation.mutate(source.id)}
+                    >
+                      Actualizar ahora
+                    </button>
+                    {source.is_active ? (
+                      <button
+                        type="button"
+                        className="btn btn-small"
+                        onClick={() => deactivateWebSourceMutation.mutate(source.id)}
+                      >
+                        Desactivar
+                      </button>
+                    ) : (
+                      <button
+                        type="button"
+                        className="btn btn-small"
+                        onClick={() => activateWebSourceMutation.mutate(source.id)}
+                      >
+                        Activar
+                      </button>
+                    )}
+                    <button
+                      type="button"
+                      className="btn btn-small btn-danger"
+                      onClick={() => {
+                        if (confirm(`¿Eliminar el documento de Drive "${source.name}"?`)) {
                           deleteWebSourceMutation.mutate(source.id);
                         }
                       }}
