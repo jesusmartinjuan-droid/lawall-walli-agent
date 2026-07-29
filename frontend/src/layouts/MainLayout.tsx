@@ -8,6 +8,7 @@ const NAV_ITEMS = [
   { to: "/prompts", label: "Prompts" },
   { to: "/documents", label: "Documentos" },
   { to: "/drafts", label: "Historial de borradores" },
+  { to: "/simulator", label: "Simulador" },
 ];
 
 export default function MainLayout() {

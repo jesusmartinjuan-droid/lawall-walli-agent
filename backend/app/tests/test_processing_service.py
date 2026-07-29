@@ -111,3 +111,23 @@ def test_process_email_respects_max_retry_attempts(db_session, monkeypatch):
     assert service.drafts.get_by_email_message_id(message.id) is None
     latest_log = service.logs.latest_for_email(message.id)
     assert latest_log.status == ProcessingLogStatus.IGNORED
+
+
+def test_simulate_draft_returns_generated_text_without_persisting_anything(db_session):
+    from sqlalchemy import func, select
+
+    from app.models.draft import Draft
+    from app.models.llm_trace import LLMTrace
+    from app.models.processing_log import ProcessingLog
+
+    service = ProcessingService(db_session)
+    result = service.simulate_draft("Hola, ¿tenéis disponibilidad para la próxima semana?")
+
+    assert result.generated_body
+    assert result.llm_provider == "mock"
+    assert result.llm_model == "mock-1"
+
+    assert db_session.scalar(select(func.count()).select_from(EmailMessage)) == 0
+    assert db_session.scalar(select(func.count()).select_from(Draft)) == 0
+    assert db_session.scalar(select(func.count()).select_from(LLMTrace)) == 0
+    assert db_session.scalar(select(func.count()).select_from(ProcessingLog)) == 0

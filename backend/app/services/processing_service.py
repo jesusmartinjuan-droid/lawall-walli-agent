@@ -30,7 +30,7 @@ from app.repositories.email_repository import EmailMessageRepository, EmailThrea
 from app.repositories.llm_trace_repository import LLMTraceRepository
 from app.repositories.mailbox_repository import MailboxRepository
 from app.repositories.processing_log_repository import ProcessingLogRepository
-from app.schemas.processing import ProcessingDetail, ProcessingListItem
+from app.schemas.processing import ProcessingDetail, ProcessingListItem, SimulateDraftResponse
 from app.services.document_service import DocumentService
 from app.services.email_provider_service import FetchedEmail
 from app.services.knowledge_context_service import KnowledgeContextService
@@ -147,6 +147,39 @@ class ProcessingService:
                 exc,
                 new_retry_count,
             )
+
+    # --- Simulator (no persistence) ---------------------------------------
+    def simulate_draft(self, email_body: str) -> SimulateDraftResponse:
+        """Generate a draft for an ad-hoc email without touching the database —
+        used by the "Simulador" screen so staff can try the agent against the
+        current prompt/knowledge base without a real mailbox or email."""
+        prompt = self.prompt_service.get_active_prompt()
+        prompt_content = prompt.content if prompt else PromptService.default_prompt_content()
+
+        documents = self.document_service.list_active_documents()
+        web_sources = self.web_source_service.list_active_web_sources()
+        knowledge_context = self.knowledge_context_service.build_context(
+            documents, web_sources, query=email_body
+        )
+
+        rendered_prompt = render_prompt_template(
+            prompt_content,
+            company_documents_context=knowledge_context,
+            email_body=email_body,
+            email_thread_context="(Prueba de simulación, sin historial previo.)",
+        )
+
+        llm_response = self.llm_service.generate_draft(
+            system_prompt=rendered_prompt,
+            user_prompt=email_body,
+            trace_name="walli-draft-simulation",
+        )
+
+        return SimulateDraftResponse(
+            generated_body=llm_response.content,
+            llm_provider=llm_response.provider,
+            llm_model=llm_response.model,
+        )
 
     def _generate_and_store_draft(self, *, mailbox, email_message: EmailMessage, retry_count: int) -> Draft:
         prompt = self.prompt_service.get_active_prompt()

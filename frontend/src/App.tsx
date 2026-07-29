@@ -8,6 +8,7 @@ import DraftHistoryPage from "./pages/DraftHistoryPage";
 import LoginPage from "./pages/LoginPage";
 import MailboxesPage from "./pages/MailboxesPage";
 import PromptsPage from "./pages/PromptsPage";
+import SimulatorPage from "./pages/SimulatorPage";
 import ProtectedRoute from "./routes/ProtectedRoute";
 
 export default function App() {
@@ -22,6 +23,7 @@ export default function App() {
           <Route path="/documents" element={<DocumentsPage />} />
           <Route path="/drafts" element={<DraftHistoryPage />} />
           <Route path="/drafts/:emailMessageId" element={<DraftDetailPage />} />
+          <Route path="/simulator" element={<SimulatorPage />} />
         </Route>
       </Route>
       <Route path="*" element={<Navigate to="/" replace />} />

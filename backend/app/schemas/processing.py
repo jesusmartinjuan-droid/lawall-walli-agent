@@ -1,6 +1,6 @@
 from datetime import datetime
 
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 
 from app.models.enums import ProcessingLogStatus, ProcessingStatus, ProcessingStep
 
@@ -55,3 +55,15 @@ class ProcessingDetail(BaseModel):
     final_status: ProcessingStatus
     retry_count: int
     logs: list[ProcessingLogItem]
+
+
+class SimulateDraftRequest(BaseModel):
+    """An ad-hoc email body to try the agent against, without a real mailbox."""
+
+    email_body: str = Field(..., min_length=1)
+
+
+class SimulateDraftResponse(BaseModel):
+    generated_body: str
+    llm_provider: str
+    llm_model: str

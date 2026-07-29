@@ -145,6 +145,12 @@ export interface ProcessingDetail {
   logs: ProcessingLogItem[];
 }
 
+export interface SimulateDraftResponse {
+  generated_body: string;
+  llm_provider: string;
+  llm_model: string;
+}
+
 export type DraftStatus = "generated" | "created_in_mailbox" | "failed_to_create_in_mailbox" | "discarded";
 
 export interface DraftListItem {
