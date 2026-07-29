@@ -272,3 +272,48 @@ def test_crawl_keeps_english_only_page_without_spanish_alternate():
     result = crawl_site("http://onlyenglish.example/", max_pages=1, client=client)
 
     assert "Only available in English." in result.extracted_text
+
+
+def test_crawl_google_doc_shared_by_link_returns_text():
+    doc_url = "https://docs.google.com/document/d/abc123XYZ/edit"
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        assert str(request.url) == "https://docs.google.com/document/d/abc123XYZ/export?format=txt"
+        return httpx.Response(200, headers={"content-type": "text/plain"}, text="Contenido del documento.")
+
+    client = httpx.Client(transport=httpx.MockTransport(handler))
+    result = crawl_site(doc_url, max_pages=20, client=client)
+
+    assert result.pages_crawled == 1
+    assert result.extracted_text == "Contenido del documento."
+    assert result.error is None
+    assert result.visited_urls == [doc_url]
+
+
+def test_crawl_google_doc_not_shared_returns_error():
+    doc_url = "https://docs.google.com/document/d/abc123XYZ/edit"
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        # Google redirects a non-public doc's export URL to an HTML sign-in
+        # page, still with a 200 status.
+        return httpx.Response(200, headers={"content-type": "text/html"}, text="<html>Sign in</html>")
+
+    client = httpx.Client(transport=httpx.MockTransport(handler))
+    result = crawl_site(doc_url, max_pages=20, client=client)
+
+    assert result.extracted_text == ""
+    assert result.error is not None
+    assert "compartido" in result.error
+
+
+def test_crawl_rejects_non_document_google_url_without_crawling():
+    def handler(request: httpx.Request) -> httpx.Response:
+        raise AssertionError("must not make any HTTP request for a non-document Google URL")
+
+    client = httpx.Client(transport=httpx.MockTransport(handler))
+    result = crawl_site("https://docs.google.com/", max_pages=20, client=client)
+
+    assert result.pages_crawled == 0
+    assert result.extracted_text == ""
+    assert result.error is not None
+    assert "documento concreto" in result.error
