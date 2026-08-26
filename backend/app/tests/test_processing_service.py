@@ -44,15 +44,46 @@ def _create_email(db_session, mailbox: Mailbox) -> EmailMessage:
     return message
 
 
-def test_render_prompt_template_substitutes_all_placeholders():
-    template = "Docs: {{company_documents_context}}\nEmail: {{email_body}}\nThread: {{email_thread_context}}"
+def test_render_prompt_template_substitutes_placeholders_when_present():
+    template = "Docs: {{company_documents_context}}\nThread: {{email_thread_context}}"
     rendered = render_prompt_template(
-        template,
-        company_documents_context="DOCS",
-        email_body="EMAIL",
-        email_thread_context="THREAD",
+        template, company_documents_context="DOCS", email_thread_context="THREAD"
     )
-    assert rendered == "Docs: DOCS\nEmail: EMAIL\nThread: THREAD"
+    assert rendered == "Docs: DOCS\nThread: THREAD"
+
+
+def test_render_prompt_template_appends_missing_placeholders_instead_of_dropping_them():
+    """A prompt pasted from scratch (no {{...}} tokens at all) must still
+    receive the knowledge base and thread history — this is the exact bug
+    that left the agent blind to company knowledge for days when a custom
+    prompt replaced the default one without knowing placeholders existed."""
+    template = "Eres Walli. Responde de forma breve y profesional."
+
+    rendered = render_prompt_template(
+        template, company_documents_context="DOCS", email_thread_context="THREAD"
+    )
+
+    assert template in rendered
+    assert "DOCS" in rendered
+    assert "THREAD" in rendered
+
+
+def test_render_prompt_template_only_appends_the_placeholder_that_is_missing():
+    template = "Fuentes: {{company_documents_context}}"
+
+    rendered = render_prompt_template(
+        template, company_documents_context="DOCS", email_thread_context="THREAD"
+    )
+
+    assert rendered.count("DOCS") == 1
+    assert "{{company_documents_context}}" not in rendered
+    assert "THREAD" in rendered
+
+
+def test_render_prompt_template_does_not_append_an_empty_value():
+    template = "Eres Walli."
+    rendered = render_prompt_template(template, company_documents_context="", email_thread_context="")
+    assert rendered == template
 
 
 def test_process_email_generates_draft_with_mock_llm_and_handles_mailbox_failure(db_session, monkeypatch):

@@ -19,10 +19,7 @@ Debes cumplir estas reglas:
 Contexto de empresa:
 {{company_documents_context}}
 
-Correo recibido:
-{{email_body}}
-
 Historial del hilo:
 {{email_thread_context}}
 
-Genera el borrador de respuesta en el mismo idioma que el correo recibido.
+El correo del cliente a responder viene a continuación como mensaje del usuario. Genera el borrador de respuesta en el mismo idioma en que esté escrito.

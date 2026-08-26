@@ -138,6 +138,22 @@ def _decode_mime_words(raw: str | None) -> str:
     return decoded
 
 
+def _normalize_header_value(value: str) -> str:
+    """Collapses embedded newlines and other stray whitespace left over from
+    folded headers (RFC 2822 line-continuation) into single spaces.
+
+    The legacy `compat32` policy used by `email.message_from_bytes` only
+    strips the leading/trailing whitespace of a folded header, not internal
+    CRLFs — so a long Subject/From wrapped by the sending server keeps a
+    literal "\\r\\n" in the middle of the parsed value. Reusing that value
+    verbatim in an outgoing header later trips Python's strict EmailPolicy
+    validation ("Header values may not contain linefeed or carriage return
+    characters"). Normalizing at parse time, once, keeps every downstream use
+    of these values (this draft's headers, the UI, threading) safe.
+    """
+    return " ".join(value.split())
+
+
 class ImapEmailProvider(EmailProvider):
     def __init__(self, credentials: ImapCredentials):
         self.credentials = credentials
@@ -218,11 +234,12 @@ class ImapEmailProvider(EmailProvider):
         raw_bytes = msg_data[0][1]
         parsed = email_lib.message_from_bytes(raw_bytes)
 
-        subject = _decode_mime_words(parsed.get("Subject"))
-        sender = _decode_mime_words(parsed.get("From"))
-        recipients = _decode_mime_words(parsed.get("To"))
-        message_id = parsed.get("Message-ID") or f"<no-message-id-{uid}@unknown>"
+        subject = _normalize_header_value(_decode_mime_words(parsed.get("Subject")))
+        sender = _normalize_header_value(_decode_mime_words(parsed.get("From")))
+        recipients = _normalize_header_value(_decode_mime_words(parsed.get("To")))
+        message_id = _normalize_header_value(parsed.get("Message-ID") or f"<no-message-id-{uid}@unknown>")
         in_reply_thread = parsed.get("References") or parsed.get("In-Reply-To")
+        in_reply_thread = _normalize_header_value(in_reply_thread) if in_reply_thread else None
 
         date_header = parsed.get("Date")
         try:

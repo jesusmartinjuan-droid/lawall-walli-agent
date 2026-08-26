@@ -66,6 +66,26 @@ def _raw_email_bytes(uid: int) -> bytes:
     ).encode()
 
 
+def _raw_email_bytes_with_folded_subject(uid: int) -> bytes:
+    """A Subject header wrapped across two physical lines, the way a real
+    sending server folds long headers (RFC 2822 line-continuation: the
+    continuation line starts with whitespace). The legacy `compat32` email
+    policy leaves the internal "\\r\\n" in the parsed value instead of fully
+    unfolding it — this is the exact shape that used to crash `create_draft`
+    with "Header values may not contain linefeed or carriage return
+    characters" for any reply built from this message."""
+    return (
+        f"From: cliente@example.com\r\n"
+        f"To: soporte@lawall.local\r\n"
+        f"Subject: Consulta {uid} sobre un pedido con un asunto muy largo que el\r\n"
+        f" servidor decide partir en dos lineas\r\n"
+        f"Message-ID: <msg-{uid}@example.com>\r\n"
+        f"Date: Mon, 1 Jan 2026 10:00:00 +0000\r\n"
+        f"\r\n"
+        f"Hola\r\n"
+    ).encode()
+
+
 def _make_provider(monkeypatch, fake_connection: _FakeImapConnection) -> ImapEmailProvider:
     monkeypatch.setattr(
         "app.services.email_provider_service.imaplib.IMAP4_SSL",
@@ -217,3 +237,45 @@ def test_fetch_new_emails_with_min_uid_searches_uid_range(monkeypatch):
 
     assert [r.imap_uid for r in results] == [43]
     assert fake_connection.search_calls == [(None, "UID", "43:*")]
+
+
+def test_fetch_new_emails_unfolds_a_subject_wrapped_across_two_lines(monkeypatch):
+    fake_connection = _FakeImapConnection(
+        search_uids=[1], messages={1: _raw_email_bytes_with_folded_subject(1)}
+    )
+    provider = _make_provider(monkeypatch, fake_connection)
+
+    [fetched] = provider.fetch_new_emails(known_uids=set(), max_emails=20)
+
+    assert "\r" not in fetched.subject
+    assert "\n" not in fetched.subject
+    assert fetched.subject == (
+        "Consulta 1 sobre un pedido con un asunto muy largo que el servidor decide partir en dos lineas"
+    )
+
+
+def test_create_draft_succeeds_when_original_subject_was_folded_across_lines(monkeypatch):
+    """Regression test for the production bug: replying to an email whose
+    Subject the sending server wrapped across two lines used to raise
+    ValueError("Header values may not contain linefeed or carriage return
+    characters") when APPENDing the draft, because the folded "\\r\\n" was
+    still embedded in `in_reply_to.subject`."""
+    fetch_connection = _FakeImapConnection(
+        search_uids=[1], messages={1: _raw_email_bytes_with_folded_subject(1)}
+    )
+    fetch_provider = _make_provider(monkeypatch, fetch_connection)
+    [fetched] = fetch_provider.fetch_new_emails(known_uids=set(), max_emails=20)
+
+    draft_connection = _FakeImapConnection()
+    draft_provider = _make_provider(monkeypatch, draft_connection)
+
+    result = draft_provider.create_draft(subject=fetched.subject, body="Respuesta", in_reply_to=fetched)
+
+    assert result.success
+    parsed = email_lib.message_from_bytes(draft_connection.appended_message)
+    # `email`'s generator may re-fold a long header on output (valid, RFC 2822
+    # behavior) — normalize whitespace the same way the References tests
+    # above do, since the fix is about the crash, not the exact fold points.
+    assert " ".join(parsed["Subject"].split()) == (
+        "Re: Consulta 1 sobre un pedido con un asunto muy largo que el servidor decide partir en dos lineas"
+    )

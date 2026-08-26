@@ -42,14 +42,40 @@ from app.services.web_source_service import WebSourceService
 logger = get_logger(__name__)
 
 
+_KNOWLEDGE_PLACEHOLDER = "{{company_documents_context}}"
+_THREAD_PLACEHOLDER = "{{email_thread_context}}"
+
+
 def render_prompt_template(
-    template: str, *, company_documents_context: str, email_body: str, email_thread_context: str
+    template: str, *, company_documents_context: str, email_thread_context: str
 ) -> str:
-    return (
-        template.replace("{{company_documents_context}}", company_documents_context)
-        .replace("{{email_body}}", email_body)
-        .replace("{{email_thread_context}}", email_thread_context)
+    """Injects the knowledge base and thread history into the prompt template.
+
+    A prompt author can place `{{company_documents_context}}` /
+    `{{email_thread_context}}` anywhere in the template for exact control
+    over where they appear. If a placeholder is absent — e.g. someone pastes
+    a brand new prompt without knowing these exist — the corresponding block
+    is appended at the end instead of silently dropped, so the model never
+    loses access to company knowledge or thread history just because the
+    template didn't ask for it explicitly.
+
+    The customer email itself has no placeholder: it's always sent as the
+    separate user-role message (see `ProcessingService`), so it can't be lost
+    this way and doesn't need to be repeated here.
+    """
+    rendered = _inject(template, _KNOWLEDGE_PLACEHOLDER, "FUENTES VIGENTES", company_documents_context)
+    rendered = _inject(
+        rendered, _THREAD_PLACEHOLDER, "HILO ANTERIOR DE LA CONVERSACIÓN", email_thread_context
     )
+    return rendered
+
+
+def _inject(template: str, placeholder: str, fallback_title: str, value: str) -> str:
+    if placeholder in template:
+        return template.replace(placeholder, value)
+    if not value:
+        return template
+    return f"{template}\n\n--- {fallback_title} ---\n{value}"
 
 
 class ProcessingService:
@@ -165,7 +191,6 @@ class ProcessingService:
         rendered_prompt = render_prompt_template(
             prompt_content,
             company_documents_context=knowledge_context,
-            email_body=email_body,
             email_thread_context="(Prueba de simulación, sin historial previo.)",
         )
 
@@ -221,7 +246,6 @@ class ProcessingService:
         rendered_prompt = render_prompt_template(
             prompt_content,
             company_documents_context=knowledge_context,
-            email_body=email_body,
             email_thread_context=thread_context,
         )
 
