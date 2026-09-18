@@ -10,10 +10,26 @@ const EXAMPLE_EMAIL =
   "Buenos días,\n\nQueríamos saber si tenéis disponibilidad para un pedido de revestimientos " +
   "para un local comercial, y si nos podéis pasar precios orientativos.\n\nGracias, un saludo.";
 
-function AttachedImagePreview({ imageId, name }: { imageId: number; name: string }) {
+// Mirrors the exact structure `_build_reply_bodies` puts in the real HTML
+// email — the reply text as a paragraph with line breaks, then the image
+// (if any) right after it — so what staff see here is what the customer
+// would actually see, not an approximation.
+function EmailBodyPreview({
+  generatedBody,
+  imageId,
+  imageName,
+}: {
+  generatedBody: string;
+  imageId: number | null;
+  imageName: string | null;
+}) {
   const [previewUrl, setPreviewUrl] = useState<string | null>(null);
 
   useEffect(() => {
+    if (imageId === null) {
+      setPreviewUrl(null);
+      return;
+    }
     let objectUrl: string | null = null;
     let cancelled = false;
     fetchAgentImagePreview(imageId).then((url) => {
@@ -31,27 +47,31 @@ function AttachedImagePreview({ imageId, name }: { imageId: number; name: string
   }, [imageId]);
 
   return (
-    <div style={{ marginTop: 16 }}>
-      <h4 style={{ margin: "0 0 8px" }}>Imagen que se incrustaría en el correo</h4>
-      <div
-        style={{
-          border: "1px solid var(--color-border)",
-          borderRadius: 8,
-          padding: 8,
-          display: "inline-block",
-        }}
-      >
-        {previewUrl ? (
-          <img src={previewUrl} alt={name} style={{ maxWidth: "100%", maxHeight: 240, display: "block" }} />
-        ) : (
-          <p className="page-subtitle" style={{ margin: 0 }}>
-            Cargando vista previa…
-          </p>
-        )}
-      </div>
-      <p className="page-subtitle" style={{ marginTop: 4 }}>
-        {name}
+    <div
+      style={{
+        border: "1px solid var(--color-border)",
+        borderRadius: 8,
+        padding: 20,
+        background: "var(--color-surface)",
+      }}
+    >
+      <p style={{ margin: 0 }}>
+        {generatedBody.split("\n").map((line, index, lines) => (
+          <span key={index}>
+            {line}
+            {index < lines.length - 1 && <br />}
+          </span>
+        ))}
       </p>
+      {imageId !== null && (
+        <p style={{ margin: "12px 0 0" }}>
+          {previewUrl ? (
+            <img src={previewUrl} alt={imageName ?? ""} style={{ maxWidth: "100%" }} />
+          ) : (
+            <span className="page-subtitle">Cargando imagen…</span>
+          )}
+        </p>
+      )}
     </div>
   );
 }
@@ -109,15 +129,11 @@ export default function SimulatorPage() {
         <div className="card">
           <h3 style={{ marginTop: 0 }}>Borrador generado</h3>
           {simulateMutation.data ? (
-            <>
-              <pre className="detail-content">{simulateMutation.data.generated_body}</pre>
-              {simulateMutation.data.attached_image_id !== null && (
-                <AttachedImagePreview
-                  imageId={simulateMutation.data.attached_image_id}
-                  name={simulateMutation.data.attached_image_name ?? ""}
-                />
-              )}
-            </>
+            <EmailBodyPreview
+              generatedBody={simulateMutation.data.generated_body}
+              imageId={simulateMutation.data.attached_image_id}
+              imageName={simulateMutation.data.attached_image_name}
+            />
           ) : (
             <p className="page-subtitle">
               {simulateMutation.isPending

@@ -86,20 +86,29 @@ _NO_IMAGE = "ninguna"
 
 def _build_draft_schema(image_schema_property: dict) -> dict:
     """The structured-output schema for real/simulated draft generation:
-    the draft text plus which configured image (if any) to attach. The
-    `image_name` enum comes from whatever images staff currently have set
-    up — see `_build_agent_image_selection` — so this is never a fixed
-    constant."""
+    which configured image (if any) to attach, plus the draft text. Deciding
+    `image_name` FIRST (schema property order) lets the model condition the
+    draft text on that decision — e.g. skip repeating a price breakdown in
+    text once it has already committed to attaching the image that shows it
+    — rather than writing the draft and only separately, disconnectedly,
+    deciding on an image afterward. The `image_name` enum comes from
+    whatever images staff currently have set up — see
+    `_build_agent_image_selection` — so this is never a fixed constant."""
     return {
         "type": "object",
         "properties": {
+            "image_name": image_schema_property,
             "draft": {
                 "type": "string",
-                "description": "El borrador de respuesta para el cliente, exactamente como se entregaría.",
+                "description": (
+                    "El borrador de respuesta para el cliente, exactamente como se entregaría. Si "
+                    '`image_name` no es "ninguna", NO escribas de nuevo en texto los datos que esa '
+                    "imagen ya muestra (p. ej. un desglose de precios por m²) — mostrar la imagen ya "
+                    "cumple cualquier obligación de incluir ese dato, no hace falta repetirlo."
+                ),
             },
-            "image_name": image_schema_property,
         },
-        "required": ["draft", "image_name"],
+        "required": ["image_name", "draft"],
         "additionalProperties": False,
     }
 
