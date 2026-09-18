@@ -13,6 +13,7 @@ The other public methods (`list_processing`, `get_processing_detail`) back the
 draft-history and processing-detail screens.
 """
 
+import json
 from datetime import UTC, datetime
 
 from sqlalchemy.orm import Session
@@ -20,6 +21,7 @@ from sqlalchemy.orm import Session
 from app.core.config import settings
 from app.core.encryption import decrypt_value
 from app.core.logging import get_logger
+from app.models.agent_image import AgentImage
 from app.models.draft import Draft
 from app.models.email_message import EmailMessage
 from app.models.enums import DraftStatus, ProcessingLogStatus, ProcessingStatus, ProcessingStep
@@ -31,8 +33,9 @@ from app.repositories.llm_trace_repository import LLMTraceRepository
 from app.repositories.mailbox_repository import MailboxRepository
 from app.repositories.processing_log_repository import ProcessingLogRepository
 from app.schemas.processing import ProcessingDetail, ProcessingListItem, SimulateDraftResponse
+from app.services.agent_image_service import AgentImageService
 from app.services.document_service import DocumentService
-from app.services.email_provider_service import FetchedEmail
+from app.services.email_provider_service import FetchedEmail, InlineImage
 from app.services.knowledge_context_service import KnowledgeContextService
 from app.services.llm_service import LLMProviderError, LLMService
 from app.services.mailbox_service import build_email_provider
@@ -78,6 +81,79 @@ def _inject(template: str, placeholder: str, fallback_title: str, value: str) ->
     return f"{template}\n\n--- {fallback_title} ---\n{value}"
 
 
+_NO_IMAGE = "ninguna"
+
+
+def _build_draft_schema(image_schema_property: dict) -> dict:
+    """The structured-output schema for real/simulated draft generation:
+    the draft text plus which configured image (if any) to attach. The
+    `image_name` enum comes from whatever images staff currently have set
+    up — see `_build_agent_image_selection` — so this is never a fixed
+    constant."""
+    return {
+        "type": "object",
+        "properties": {
+            "draft": {
+                "type": "string",
+                "description": "El borrador de respuesta para el cliente, exactamente como se entregaría.",
+            },
+            "image_name": image_schema_property,
+        },
+        "required": ["draft", "image_name"],
+        "additionalProperties": False,
+    }
+
+
+def _build_agent_image_selection(images: list[AgentImage]) -> tuple[dict, str]:
+    """Builds the JSON-schema property + system note for choosing which
+    configured image (if any) to embed in this specific reply, from the
+    images staff currently have set up. Shared by real draft generation and
+    the Simulador so both exercise identical, always-current behavior — an
+    image added, renamed or removed from the "Imágenes del agente" screen
+    takes effect on the very next email, no code change or redeploy.
+    """
+    enum_values = [image.name for image in images] + [_NO_IMAGE]
+    schema_property = {
+        "type": "string",
+        "enum": enum_values,
+        "description": (
+            'Nombre EXACTO de la imagen a adjuntar si corresponde, o "ninguna" si no aplica ninguna.'
+        ),
+    }
+    if not images:
+        return schema_property, ""
+
+    lines = "\n".join(f"- {image.name}: {image.description}" for image in images)
+    note = f"""
+
+============================================================
+IMÁGENES DISPONIBLES PARA ADJUNTAR (elige el nombre EXACTO en "image_name" si corresponde, o "{_NO_IMAGE}")
+============================================================
+{lines}
+"""
+    return schema_property, note
+
+
+def _parse_draft_with_image(raw: str) -> tuple[str, str | None]:
+    """Parses the {"draft": ..., "image_name": ...} structured output into
+    (draft_text, chosen_image_name_or_None). Falls back to (raw, None) if the
+    response isn't valid JSON (e.g. a provider that ignores
+    `response_schema`), so a malformed response never breaks generation —
+    it just means no image gets attached."""
+    try:
+        payload = json.loads(raw)
+    except (json.JSONDecodeError, TypeError):
+        return raw.strip(), None
+    if not isinstance(payload, dict):
+        return raw.strip(), None
+
+    draft = str(payload.get("draft", raw)).strip()
+    image_name = payload.get("image_name")
+    if not image_name or image_name == _NO_IMAGE:
+        image_name = None
+    return draft, image_name
+
+
 class ProcessingService:
     def __init__(self, db: Session):
         self.db = db
@@ -90,6 +166,7 @@ class ProcessingService:
         self.prompt_service = PromptService(db)
         self.document_service = DocumentService(db)
         self.web_source_service = WebSourceService(db)
+        self.agent_image_service = AgentImageService(db)
         self.knowledge_context_service = KnowledgeContextService()
         self.llm_service = LLMService()
 
@@ -194,16 +271,34 @@ class ProcessingService:
             email_thread_context="(Prueba de simulación, sin historial previo.)",
         )
 
+        response_schema = None
+        if settings.enable_agent_image_embedding:
+            agent_images = self.agent_image_service.list_all()
+            image_schema_property, image_note = _build_agent_image_selection(agent_images)
+            rendered_prompt += image_note
+            response_schema = _build_draft_schema(image_schema_property)
+
         llm_response = self.llm_service.generate_draft(
             system_prompt=rendered_prompt,
             user_prompt=email_body,
             trace_name="walli-draft-simulation",
+            response_schema=response_schema,
         )
 
+        generated_body = llm_response.content
+        attached_image = None
+        if response_schema is not None:
+            generated_body, chosen_image_name = _parse_draft_with_image(llm_response.content)
+            attached_image = (
+                self.agent_image_service.get_by_name(chosen_image_name) if chosen_image_name else None
+            )
+
         return SimulateDraftResponse(
-            generated_body=llm_response.content,
+            generated_body=generated_body,
             llm_provider=llm_response.provider,
             llm_model=llm_response.model,
+            attached_image_id=attached_image.id if attached_image else None,
+            attached_image_name=attached_image.name if attached_image else None,
         )
 
     def _generate_and_store_draft(self, *, mailbox, email_message: EmailMessage, retry_count: int) -> Draft:
@@ -249,11 +344,19 @@ class ProcessingService:
             email_thread_context=thread_context,
         )
 
+        response_schema = None
+        if settings.enable_agent_image_embedding:
+            agent_images = self.agent_image_service.list_all()
+            image_schema_property, image_note = _build_agent_image_selection(agent_images)
+            rendered_prompt += image_note
+            response_schema = _build_draft_schema(image_schema_property)
+
         try:
             llm_response = self.llm_service.generate_draft(
                 system_prompt=rendered_prompt,
                 user_prompt=email_body,
                 trace_name=f"walli-draft-email-{email_message.id}",
+                response_schema=response_schema,
             )
         except LLMProviderError:
             self._log(
@@ -276,11 +379,25 @@ class ProcessingService:
             retry_count=retry_count,
         )
 
+        generated_body = llm_response.content
+        attached_image = None
+        if response_schema is not None:
+            generated_body, chosen_image_name = _parse_draft_with_image(llm_response.content)
+            if chosen_image_name:
+                attached_image = self.agent_image_service.get_by_name(chosen_image_name)
+                if attached_image is None:
+                    logger.warning(
+                        "agent_image_chosen_but_not_found email_id=%s name=%r",
+                        email_message.id,
+                        chosen_image_name,
+                    )
+
         draft = Draft(
             mailbox_id=mailbox.id,
             email_message_id=email_message.id,
             prompt_template_id=prompt.id if prompt else None,
-            generated_body=llm_response.content,
+            agent_image_id=attached_image.id if attached_image else None,
+            generated_body=generated_body,
             rendered_prompt=rendered_prompt,
             llm_provider=llm_response.provider,
             llm_model=llm_response.model,
@@ -335,7 +452,10 @@ class ProcessingService:
                 references_chain=references_chain,
             )
             result = provider.create_draft(
-                subject=email_message.subject, body=draft.generated_body, in_reply_to=in_reply_to
+                subject=email_message.subject,
+                body=draft.generated_body,
+                in_reply_to=in_reply_to,
+                inline_image=self._load_inline_image(draft),
             )
 
             if result.success:
@@ -372,6 +492,25 @@ class ProcessingService:
                 retry_count=retry_count,
             )
             logger.error("create_draft_in_mailbox_failed email_id=%s error=%s", email_message.id, exc)
+
+    def _load_inline_image(self, draft: Draft) -> InlineImage | None:
+        if draft.agent_image_id is None:
+            return None
+        image = self.agent_image_service.get(draft.agent_image_id)
+        if image is None:
+            # Staff deleted the image between generation and this point —
+            # degrade gracefully to no image rather than failing the draft.
+            logger.warning(
+                "agent_image_missing_at_send_time draft_id=%s agent_image_id=%s",
+                draft.id,
+                draft.agent_image_id,
+            )
+            return None
+        return InlineImage(
+            content=self.agent_image_service.read_bytes(image),
+            content_type=image.content_type,
+            filename=image.original_filename,
+        )
 
     def _list_previous_thread_messages(self, email_message: EmailMessage) -> list[EmailMessage]:
         if email_message.thread_id is None:

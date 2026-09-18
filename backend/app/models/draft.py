@@ -24,6 +24,12 @@ class Draft(Base, TimestampMixin):
     prompt_template_id: Mapped[int | None] = mapped_column(
         ForeignKey("prompt_templates.id", ondelete="SET NULL"), nullable=True
     )
+    # The agent image (if any) the model chose to embed inline in this reply.
+    # SET NULL on delete: if staff later delete the image, the draft's own
+    # history shouldn't be lost — it just stops pointing at an image.
+    agent_image_id: Mapped[int | None] = mapped_column(
+        ForeignKey("agent_images.id", ondelete="SET NULL"), nullable=True
+    )
 
     generated_body: Mapped[str] = mapped_column(Text, nullable=False)
     rendered_prompt: Mapped[str | None] = mapped_column(Text, nullable=True)

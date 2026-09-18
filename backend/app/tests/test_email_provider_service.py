@@ -3,14 +3,24 @@ real network access by faking the `imaplib.IMAP4_SSL` connection and
 inspecting the exact bytes it would have APPENDed to the mailbox."""
 
 import email as email_lib
+import io
 from datetime import UTC, datetime
+
+from PIL import Image
 
 from app.services.email_provider_service import (
     FetchedEmail,
     ImapCredentials,
     ImapEmailProvider,
+    InlineImage,
     _extract_bodies,
 )
+
+
+def _png_bytes() -> bytes:
+    buffer = io.BytesIO()
+    Image.new("RGB", (4, 4), color=(255, 0, 0)).save(buffer, format="PNG")
+    return buffer.getvalue()
 
 
 class _FakeImapConnection:
@@ -201,6 +211,62 @@ def test_create_draft_uses_placeholder_when_original_has_no_text_body(monkeypatc
 
     assert "Correo original sin contenido de texto" in body_text
     assert "Correo original sin contenido de texto" in body_html
+
+
+def test_create_draft_with_inline_image_embeds_it_as_cid_not_attachment(monkeypatch):
+    """Mandatory smoke test for the add_related()/cid: mechanics — no prior
+    usage of this exists anywhere in the codebase, so this proves the
+    resulting MIME structure is what a mail client would actually render
+    (an inline image, not a file attachment) before anything downstream is
+    wired to depend on it."""
+    fake_connection = _FakeImapConnection()
+    provider = _make_provider(monkeypatch, fake_connection)
+    image_bytes = _png_bytes()
+    inline_image = InlineImage(content=image_bytes, content_type="image/png", filename="tabla.png")
+
+    result = provider.create_draft(
+        subject="Consulta",
+        body="Aquí tienes la tabla.",
+        in_reply_to=_fetched_email(),
+        inline_image=inline_image,
+    )
+
+    assert result.success
+    parsed = email_lib.message_from_bytes(fake_connection.appended_message)
+    assert parsed.is_multipart()
+
+    image_parts = [part for part in parsed.walk() if part.get_content_type() == "image/png"]
+    assert len(image_parts) == 1
+    image_part = image_parts[0]
+
+    # Embedded inline (Content-ID reference), never as a file attachment.
+    assert "attachment" not in str(image_part.get("Content-Disposition") or "")
+    assert image_part.get_payload(decode=True) == image_bytes
+
+    content_id = image_part.get("Content-ID")
+    assert content_id is not None
+    bare_cid = content_id.strip("<>")
+
+    html_parts = [part for part in parsed.walk() if part.get_content_type() == "text/html"]
+    assert len(html_parts) == 1
+    html_text = html_parts[0].get_payload(decode=True).decode("utf-8")
+    assert f"cid:{bare_cid}" in html_text
+
+    plain_parts = [part for part in parsed.walk() if part.get_content_type() == "text/plain"]
+    assert len(plain_parts) == 1
+    plain_text = plain_parts[0].get_payload(decode=True).decode("utf-8")
+    assert "cid:" not in plain_text
+
+
+def test_create_draft_without_inline_image_attaches_nothing(monkeypatch):
+    fake_connection = _FakeImapConnection()
+    provider = _make_provider(monkeypatch, fake_connection)
+
+    provider.create_draft(subject="Consulta", body="Respuesta", in_reply_to=_fetched_email())
+
+    parsed = email_lib.message_from_bytes(fake_connection.appended_message)
+    image_parts = [part for part in parsed.walk() if part.get_content_maintype() == "image"]
+    assert image_parts == []
 
 
 def test_get_latest_uid_returns_uidnext_minus_one(monkeypatch):

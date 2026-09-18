@@ -159,6 +159,8 @@ export interface SimulateDraftResponse {
   generated_body: string;
   llm_provider: string;
   llm_model: string;
+  attached_image_id: number | null;
+  attached_image_name: string | null;
 }
 
 export type DraftStatus = "generated" | "created_in_mailbox" | "failed_to_create_in_mailbox" | "discarded";

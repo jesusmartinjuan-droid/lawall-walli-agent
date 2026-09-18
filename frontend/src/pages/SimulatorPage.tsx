@@ -1,13 +1,60 @@
 import { useMutation } from "@tanstack/react-query";
-import { useState } from "react";
+import { useEffect, useState } from "react";
 import type { FormEvent } from "react";
 
+import { fetchAgentImagePreview } from "../api/agent-images";
 import { simulateDraft } from "../api/processing";
 import { getErrorMessage } from "../utils/getErrorMessage";
 
 const EXAMPLE_EMAIL =
   "Buenos días,\n\nQueríamos saber si tenéis disponibilidad para un pedido de revestimientos " +
   "para un local comercial, y si nos podéis pasar precios orientativos.\n\nGracias, un saludo.";
+
+function AttachedImagePreview({ imageId, name }: { imageId: number; name: string }) {
+  const [previewUrl, setPreviewUrl] = useState<string | null>(null);
+
+  useEffect(() => {
+    let objectUrl: string | null = null;
+    let cancelled = false;
+    fetchAgentImagePreview(imageId).then((url) => {
+      if (cancelled) {
+        if (url) URL.revokeObjectURL(url);
+        return;
+      }
+      objectUrl = url;
+      setPreviewUrl(url);
+    });
+    return () => {
+      cancelled = true;
+      if (objectUrl) URL.revokeObjectURL(objectUrl);
+    };
+  }, [imageId]);
+
+  return (
+    <div style={{ marginTop: 16 }}>
+      <h4 style={{ margin: "0 0 8px" }}>Imagen que se incrustaría en el correo</h4>
+      <div
+        style={{
+          border: "1px solid var(--color-border)",
+          borderRadius: 8,
+          padding: 8,
+          display: "inline-block",
+        }}
+      >
+        {previewUrl ? (
+          <img src={previewUrl} alt={name} style={{ maxWidth: "100%", maxHeight: 240, display: "block" }} />
+        ) : (
+          <p className="page-subtitle" style={{ margin: 0 }}>
+            Cargando vista previa…
+          </p>
+        )}
+      </div>
+      <p className="page-subtitle" style={{ marginTop: 4 }}>
+        {name}
+      </p>
+    </div>
+  );
+}
 
 export default function SimulatorPage() {
   const [emailBody, setEmailBody] = useState("");
@@ -62,7 +109,15 @@ export default function SimulatorPage() {
         <div className="card">
           <h3 style={{ marginTop: 0 }}>Borrador generado</h3>
           {simulateMutation.data ? (
-            <pre className="detail-content">{simulateMutation.data.generated_body}</pre>
+            <>
+              <pre className="detail-content">{simulateMutation.data.generated_body}</pre>
+              {simulateMutation.data.attached_image_id !== null && (
+                <AttachedImagePreview
+                  imageId={simulateMutation.data.attached_image_id}
+                  name={simulateMutation.data.attached_image_name ?? ""}
+                />
+              )}
+            </>
           ) : (
             <p className="page-subtitle">
               {simulateMutation.isPending

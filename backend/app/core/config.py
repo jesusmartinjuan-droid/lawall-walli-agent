@@ -56,6 +56,12 @@ class Settings(BaseSettings):
     documents_storage_path: str = "/app/storage/documents"
     max_knowledge_context_chars: int = 600000
 
+    # Agent images (inline images the agent can attach, e.g. a price table)
+    # — a kill switch so the feature can be disabled instantly via env var
+    # if the structured-output draft generation misbehaves in production,
+    # without a code revert/redeploy under pressure.
+    enable_agent_image_embedding: bool = True
+
     # Web sources (website knowledge ingestion)
     web_source_poll_interval_seconds: int = 86400
 

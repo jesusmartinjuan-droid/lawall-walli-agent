@@ -8,6 +8,7 @@ into `get_llm_provider()` — no changes needed in processing_service.py.
 
 from __future__ import annotations
 
+import json
 import time
 from abc import ABC, abstractmethod
 from dataclasses import dataclass
@@ -41,7 +42,9 @@ class LLMProvider(ABC):
     name: str
 
     @abstractmethod
-    def generate(self, *, system_prompt: str, user_prompt: str) -> LLMResponse: ...
+    def generate(
+        self, *, system_prompt: str, user_prompt: str, response_schema: dict | None = None
+    ) -> LLMResponse: ...
 
 
 class OpenAILLMProvider(LLMProvider):
@@ -58,9 +61,21 @@ class OpenAILLMProvider(LLMProvider):
 
         return OpenAI(api_key=self._api_key)
 
-    def generate(self, *, system_prompt: str, user_prompt: str) -> LLMResponse:
+    def generate(
+        self, *, system_prompt: str, user_prompt: str, response_schema: dict | None = None
+    ) -> LLMResponse:
         def _call():
             client = self._client()
+            kwargs = {}
+            if response_schema is not None:
+                kwargs["response_format"] = {
+                    "type": "json_schema",
+                    "json_schema": {
+                        "name": "walli_structured_output",
+                        "schema": response_schema,
+                        "strict": True,
+                    },
+                }
             return client.chat.completions.create(
                 model=self.model,
                 temperature=self.temperature,
@@ -69,6 +84,7 @@ class OpenAILLMProvider(LLMProvider):
                     {"role": "system", "content": system_prompt},
                     {"role": "user", "content": user_prompt},
                 ],
+                **kwargs,
             )
 
         started = time.monotonic()
@@ -99,6 +115,38 @@ class OpenAILLMProvider(LLMProvider):
         )
 
 
+def _mock_structured_stub(schema: dict, draft_text: str) -> dict:
+    """Builds a minimal, schema-shaped JSON object for MockLLMProvider,
+    generically from `response_schema["properties"]`, so any structured
+    output shape (present or future) works locally without an API key and
+    without hardcoding a stub per schema here. The "draft" string property,
+    if present, gets the canned draft text; everything else gets a
+    conservative empty/default value (preferring an explicit "none" enum
+    member when the schema declares one, since that's the safe "nothing to
+    do" choice for the kind of yes/no/which-option fields these schemas add
+    alongside "draft")."""
+    properties = schema.get("properties", {})
+    result: dict = {}
+    for name, prop_schema in properties.items():
+        if name == "draft" and prop_schema.get("type") == "string":
+            result[name] = draft_text
+            continue
+        if "enum" in prop_schema:
+            enum_values = prop_schema["enum"]
+            result[name] = "none" if "none" in enum_values else (enum_values[0] if enum_values else "")
+        elif prop_schema.get("type") == "array":
+            result[name] = []
+        elif prop_schema.get("type") == "string":
+            result[name] = ""
+        elif prop_schema.get("type") in ("integer", "number"):
+            result[name] = 0
+        elif prop_schema.get("type") == "boolean":
+            result[name] = False
+        else:
+            result[name] = None
+    return result
+
+
 class MockLLMProvider(LLMProvider):
     """Deterministic fallback used when no LLM_PROVIDER API key is configured.
 
@@ -107,14 +155,17 @@ class MockLLMProvider(LLMProvider):
 
     name = "mock"
 
-    def generate(self, *, system_prompt: str, user_prompt: str) -> LLMResponse:
+    def generate(
+        self, *, system_prompt: str, user_prompt: str, response_schema: dict | None = None
+    ) -> LLMResponse:
         started = time.monotonic()
-        content = (
+        draft = (
             "Gracias por tu mensaje. Estamos revisando tu consulta y te "
             "responderemos con la información necesaria en cuanto la tengamos "
             "disponible.\n\n[Borrador generado por el proveedor LLM 'mock': "
             "configura OPENAI_API_KEY para generar respuestas reales.]"
         )
+        content = json.dumps(_mock_structured_stub(response_schema, draft)) if response_schema else draft
         latency_ms = int((time.monotonic() - started) * 1000)
         return LLMResponse(
             content=content,
@@ -145,9 +196,18 @@ class LLMService:
     def __init__(self, provider: LLMProvider | None = None):
         self.provider = provider or get_llm_provider()
 
-    def generate_draft(self, *, system_prompt: str, user_prompt: str, trace_name: str) -> LLMResponse:
+    def generate_draft(
+        self,
+        *,
+        system_prompt: str,
+        user_prompt: str,
+        trace_name: str,
+        response_schema: dict | None = None,
+    ) -> LLMResponse:
         try:
-            response = self.provider.generate(system_prompt=system_prompt, user_prompt=user_prompt)
+            response = self.provider.generate(
+                system_prompt=system_prompt, user_prompt=user_prompt, response_schema=response_schema
+            )
         except Exception as exc:
             langfuse_client.record_llm_trace(
                 name=trace_name,

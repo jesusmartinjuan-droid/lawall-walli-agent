@@ -67,3 +67,8 @@ class SimulateDraftResponse(BaseModel):
     generated_body: str
     llm_provider: str
     llm_model: str
+    # The agent image (if any) that would be embedded inline in a real reply
+    # to this email — lets the Simulador preview exactly what a customer
+    # would see, not just the draft text.
+    attached_image_id: int | None = None
+    attached_image_name: str | None = None
