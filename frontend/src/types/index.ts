@@ -63,6 +63,16 @@ export interface DocumentItem {
   updated_at: string;
 }
 
+export interface AgentImage {
+  id: number;
+  name: string;
+  description: string;
+  original_filename: string;
+  content_type: string;
+  created_at: string;
+  updated_at: string;
+}
+
 export interface WebSource {
   id: number;
   name: string;

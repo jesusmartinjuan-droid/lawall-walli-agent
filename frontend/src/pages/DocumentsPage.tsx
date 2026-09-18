@@ -1,7 +1,8 @@
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
-import { useRef, useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import type { ChangeEvent, FormEvent } from "react";
 
+import { createAgentImage, deleteAgentImage, fetchAgentImagePreview, listAgentImages } from "../api/agent-images";
 import { deleteDocument, listDocuments, uploadDocument } from "../api/documents";
 import {
   activateWebSource,
@@ -16,6 +17,7 @@ import { formatDateTime } from "../utils/formatDate";
 import { getErrorMessage } from "../utils/getErrorMessage";
 
 const ACCEPTED_EXTENSIONS = ".txt,.md,.pdf,.docx,.xlsx";
+const ACCEPTED_IMAGE_EXTENSIONS = ".png,.jpg,.jpeg";
 
 const EMPTY_WEB_SOURCE_FORM: WebSourceFormValues = {
   name: "",
@@ -24,6 +26,7 @@ const EMPTY_WEB_SOURCE_FORM: WebSourceFormValues = {
 };
 
 const EMPTY_DRIVE_FORM = { name: "", root_url: "" };
+const EMPTY_AGENT_IMAGE_FORM = { name: "", description: "" };
 
 function isGoogleDocsSource(rootUrl: string): boolean {
   try {
@@ -32,6 +35,30 @@ function isGoogleDocsSource(rootUrl: string): boolean {
   } catch {
     return false;
   }
+}
+
+function AgentImageThumbnail({ imageId, name }: { imageId: number; name: string }) {
+  const [previewUrl, setPreviewUrl] = useState<string | null>(null);
+
+  useEffect(() => {
+    let objectUrl: string | null = null;
+    let cancelled = false;
+    fetchAgentImagePreview(imageId).then((url) => {
+      if (cancelled) {
+        if (url) URL.revokeObjectURL(url);
+        return;
+      }
+      objectUrl = url;
+      setPreviewUrl(url);
+    });
+    return () => {
+      cancelled = true;
+      if (objectUrl) URL.revokeObjectURL(objectUrl);
+    };
+  }, [imageId]);
+
+  if (!previewUrl) return <span className="page-subtitle">—</span>;
+  return <img src={previewUrl} alt={name} style={{ maxWidth: 80, maxHeight: 50, borderRadius: 4 }} />;
 }
 
 export default function DocumentsPage() {
@@ -127,6 +154,42 @@ export default function DocumentsPage() {
     event.preventDefault();
     setDriveFormError(null);
     createDriveSourceMutation.mutate({ ...driveForm, max_pages: 20 });
+  }
+
+  // --- Agent images -------------------------------------------------------
+  const { data: agentImages, isLoading: isLoadingAgentImages } = useQuery({
+    queryKey: ["agent-images"],
+    queryFn: listAgentImages,
+  });
+  const [showAgentImageForm, setShowAgentImageForm] = useState(false);
+  const [agentImageForm, setAgentImageForm] = useState(EMPTY_AGENT_IMAGE_FORM);
+  const [agentImageFormError, setAgentImageFormError] = useState<string | null>(null);
+  const agentImageFileInputRef = useRef<HTMLInputElement>(null);
+
+  const invalidateAgentImages = () => queryClient.invalidateQueries({ queryKey: ["agent-images"] });
+
+  const createAgentImageMutation = useMutation({
+    mutationFn: createAgentImage,
+    onSuccess: () => {
+      invalidateAgentImages();
+      setShowAgentImageForm(false);
+      setAgentImageForm(EMPTY_AGENT_IMAGE_FORM);
+      setAgentImageFormError(null);
+      if (agentImageFileInputRef.current) agentImageFileInputRef.current.value = "";
+    },
+    onError: (error) => setAgentImageFormError(getErrorMessage(error, "No se pudo subir la imagen.")),
+  });
+  const deleteAgentImageMutation = useMutation({ mutationFn: deleteAgentImage, onSuccess: invalidateAgentImages });
+
+  function handleAgentImageSubmit(event: FormEvent) {
+    event.preventDefault();
+    setAgentImageFormError(null);
+    const file = agentImageFileInputRef.current?.files?.[0];
+    if (!file) {
+      setAgentImageFormError("Selecciona un archivo de imagen.");
+      return;
+    }
+    createAgentImageMutation.mutate({ ...agentImageForm, file });
   }
 
   return (
@@ -511,6 +574,136 @@ export default function DocumentsPage() {
                       {source.last_fetch_error}
                     </p>
                   )}
+                </td>
+              </tr>
+            ))}
+          </tbody>
+        </table>
+      )}
+
+      <div className="page-header" style={{ marginTop: 40 }}>
+        <div>
+          <h2 style={{ marginTop: 0 }}>Imágenes del agente</h2>
+          <p className="page-subtitle">
+            Imágenes que el agente puede incrustar en un borrador (por ejemplo, la tabla de precios
+            en español o en inglés). Ponle un nombre y describe cuándo debe usarse — el agente
+            decide en cada respuesta, según esa descripción, si corresponde adjuntar alguna. Para
+            añadir un caso nuevo, sube la imagen aquí: no hace falta tocar nada más.
+          </p>
+        </div>
+        {!showAgentImageForm && (
+          <button
+            type="button"
+            className="btn btn-primary"
+            onClick={() => {
+              setAgentImageFormError(null);
+              setShowAgentImageForm(true);
+            }}
+          >
+            Nueva imagen
+          </button>
+        )}
+      </div>
+
+      {showAgentImageForm && (
+        <form className="card" style={{ marginBottom: 24 }} onSubmit={handleAgentImageSubmit}>
+          <h3 style={{ marginTop: 0 }}>Nueva imagen</h3>
+          <div className="form-grid">
+            <div className="form-field">
+              <label htmlFor="agent-image-name">Nombre</label>
+              <input
+                id="agent-image-name"
+                type="text"
+                placeholder="Tabla de precios (Español)"
+                value={agentImageForm.name}
+                onChange={(e) => setAgentImageForm({ ...agentImageForm, name: e.target.value })}
+                required
+              />
+            </div>
+            <div className="form-field">
+              <label htmlFor="agent-image-description">¿Cuándo debe usarse?</label>
+              <textarea
+                id="agent-image-description"
+                placeholder="Usar cuando el cliente pregunte por precios y el correo esté en español."
+                value={agentImageForm.description}
+                onChange={(e) => setAgentImageForm({ ...agentImageForm, description: e.target.value })}
+                style={{ width: "100%", minHeight: 70 }}
+                required
+              />
+            </div>
+            <div className="form-field">
+              <label htmlFor="agent-image-file">Imagen (PNG o JPG)</label>
+              <input
+                ref={agentImageFileInputRef}
+                id="agent-image-file"
+                type="file"
+                accept={ACCEPTED_IMAGE_EXTENSIONS}
+                required
+              />
+            </div>
+          </div>
+          {agentImageFormError && <p className="error-text">{agentImageFormError}</p>}
+          <div className="btn-row">
+            <button
+              type="submit"
+              className="btn btn-primary"
+              disabled={createAgentImageMutation.isPending}
+            >
+              {createAgentImageMutation.isPending ? "Subiendo…" : "Guardar"}
+            </button>
+            <button
+              type="button"
+              className="btn btn-secondary"
+              onClick={() => {
+                setShowAgentImageForm(false);
+                setAgentImageForm(EMPTY_AGENT_IMAGE_FORM);
+                setAgentImageFormError(null);
+              }}
+            >
+              Cancelar
+            </button>
+          </div>
+        </form>
+      )}
+
+      {isLoadingAgentImages && <p>Cargando…</p>}
+
+      {agentImages && agentImages.length === 0 && !showAgentImageForm && (
+        <div className="empty-state">No hay imágenes configuradas todavía.</div>
+      )}
+
+      {agentImages && agentImages.length > 0 && (
+        <table>
+          <thead>
+            <tr>
+              <th></th>
+              <th>Nombre</th>
+              <th>Cuándo se usa</th>
+              <th>Subida</th>
+              <th></th>
+            </tr>
+          </thead>
+          <tbody>
+            {agentImages.map((image) => (
+              <tr key={image.id}>
+                <td>
+                  <AgentImageThumbnail imageId={image.id} name={image.name} />
+                </td>
+                <td>{image.name}</td>
+                <td style={{ maxWidth: 360 }}>{image.description}</td>
+                <td>{formatDateTime(image.created_at)}</td>
+                <td>
+                  <button
+                    type="button"
+                    className="btn btn-small btn-danger"
+                    onClick={() => {
+                      if (confirm(`¿Eliminar la imagen "${image.name}"?`)) {
+                        deleteAgentImageMutation.mutate(image.id);
+                      }
+                    }}
+                  >
+                    Eliminar
+                  </button>
                 </td>
               </tr>
             ))}

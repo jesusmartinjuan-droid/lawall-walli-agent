@@ -5,6 +5,7 @@ can see the full schema.
 """
 
 from app.db.base import Base
+from app.models.agent_image import AgentImage
 from app.models.document import Document
 from app.models.draft import Draft
 from app.models.email_message import EmailMessage
@@ -28,4 +29,5 @@ __all__ = [
     "ProcessingLog",
     "LLMTrace",
     "WebSource",
+    "AgentImage",
 ]
