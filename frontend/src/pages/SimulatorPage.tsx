@@ -62,7 +62,36 @@ export default function SimulatorPage() {
         <div className="card">
           <h3 style={{ marginTop: 0 }}>Borrador generado</h3>
           {simulateMutation.data ? (
-            <pre className="detail-content">{simulateMutation.data.generated_body}</pre>
+            <>
+              <pre className="detail-content">{simulateMutation.data.generated_body}</pre>
+              <div style={{ marginTop: 16 }}>
+                <h4 style={{ margin: "0 0 8px" }}>De dónde ha sacado esta respuesta</h4>
+                {simulateMutation.data.sources_used.length > 0 ? (
+                  <div style={{ display: "flex", flexDirection: "column", gap: 10 }}>
+                    {simulateMutation.data.sources_used.map((citation, index) => (
+                      <div
+                        key={index}
+                        style={{
+                          borderLeft: "3px solid var(--color-border)",
+                          paddingLeft: 10,
+                        }}
+                      >
+                        <span className="badge tone-neutral">{citation.source}</span>
+                        <p style={{ fontStyle: "italic", margin: "4px 0 0" }}>“{citation.excerpt}”</p>
+                      </div>
+                    ))}
+                  </div>
+                ) : (
+                  <p className="page-subtitle" style={{ margin: 0 }}>
+                    El agente no citó ninguna fuente concreta para esta respuesta.
+                  </p>
+                )}
+                <p className="page-subtitle" style={{ marginTop: 8 }}>
+                  Si una respuesta no es correcta, este es el documento y el fragmento que hay que
+                  revisar o ajustar.
+                </p>
+              </div>
+            </>
           ) : (
             <p className="page-subtitle">
               {simulateMutation.isPending

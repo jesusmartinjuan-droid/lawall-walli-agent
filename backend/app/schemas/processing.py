@@ -63,7 +63,20 @@ class SimulateDraftRequest(BaseModel):
     email_body: str = Field(..., min_length=1)
 
 
+class SourceCitation(BaseModel):
+    """One (source, verbatim excerpt) pair confirmed to actually appear in the
+    knowledge base sent to the model for this specific simulated question —
+    lets staff see not just which document was consulted, but the exact, real
+    passage behind the answer, so they know precisely what to edit if a
+    response needs adjusting. Unverifiable self-reported citations are
+    dropped before reaching this schema, so every entry here is trustworthy."""
+
+    source: str
+    excerpt: str
+
+
 class SimulateDraftResponse(BaseModel):
     generated_body: str
     llm_provider: str
     llm_model: str
+    sources_used: list[SourceCitation]

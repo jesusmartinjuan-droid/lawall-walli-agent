@@ -13,6 +13,8 @@ The other public methods (`list_processing`, `get_processing_detail`) back the
 draft-history and processing-detail screens.
 """
 
+import difflib
+import json
 from datetime import UTC, datetime
 
 from sqlalchemy.orm import Session
@@ -30,7 +32,12 @@ from app.repositories.email_repository import EmailMessageRepository, EmailThrea
 from app.repositories.llm_trace_repository import LLMTraceRepository
 from app.repositories.mailbox_repository import MailboxRepository
 from app.repositories.processing_log_repository import ProcessingLogRepository
-from app.schemas.processing import ProcessingDetail, ProcessingListItem, SimulateDraftResponse
+from app.schemas.processing import (
+    ProcessingDetail,
+    ProcessingListItem,
+    SimulateDraftResponse,
+    SourceCitation,
+)
 from app.services.document_service import DocumentService
 from app.services.email_provider_service import FetchedEmail
 from app.services.knowledge_context_service import KnowledgeContextService
@@ -76,6 +83,131 @@ def _inject(template: str, placeholder: str, fallback_title: str, value: str) ->
     if not value:
         return template
     return f"{template}\n\n--- {fallback_title} ---\n{value}"
+
+
+_SOURCE_ATTRIBUTION_NOTE = """
+
+============================================================
+NOTA SOLO PARA ESTA PRUEBA (no forma parte del prompt real; nunca la apliques a un correo de verdad)
+============================================================
+
+Además del borrador, debes devolver, por cada afirmación concreta que se apoye en una fuente, el \
+nombre exacto de esa fuente (tal y como aparece precedido de "###" entre las fuentes vigentes) y un \
+fragmento literal, textual, de una o dos frases, copiado tal cual de esa fuente — nunca lo \
+parafrasees ni lo inventes. Si no te has apoyado en ninguna fuente concreta, deja esa lista vacía.
+"""
+
+_SIMULATOR_OUTPUT_SCHEMA = {
+    "type": "object",
+    "properties": {
+        "draft": {
+            "type": "string",
+            "description": "El borrador de respuesta para el cliente, exactamente como se entregaría.",
+        },
+        "citations": {
+            "type": "array",
+            "description": "Fuentes concretas usadas para fundamentar el borrador, con su cita literal.",
+            "items": {
+                "type": "object",
+                "properties": {
+                    "source": {
+                        "type": "string",
+                        "description": 'Nombre exacto de la fuente, tal y como aparece precedido de "###".',
+                    },
+                    "excerpt": {
+                        "type": "string",
+                        "description": "Fragmento literal, copiado tal cual de esa fuente.",
+                    },
+                },
+                "required": ["source", "excerpt"],
+                "additionalProperties": False,
+            },
+        },
+    },
+    "required": ["draft", "citations"],
+    "additionalProperties": False,
+}
+
+
+def _parse_structured_simulator_output(raw: str) -> tuple[str, list[SourceCitation]]:
+    """Parses the simulator's structured (JSON-schema-constrained) LLM output
+    into the customer-facing draft and the (source, verbatim excerpt)
+    citations the model reports relying on for this specific answer — lets
+    the "Simulador" screen show staff not just which document was consulted,
+    but the exact passage, without exposing how the knowledge base is stored
+    or searched internally. Falls back to (raw, []) if the response isn't
+    valid JSON (e.g. a provider that ignores `response_schema`), so a
+    malformed response never breaks the screen. Callers should run the
+    result through `_filter_verified_citations` before showing it — the
+    model self-reports these, so they aren't guaranteed accurate yet.
+    """
+    try:
+        payload = json.loads(raw)
+    except (json.JSONDecodeError, TypeError):
+        return raw.strip(), []
+
+    draft = payload.get("draft", raw) if isinstance(payload, dict) else raw
+    raw_citations = payload.get("citations", []) if isinstance(payload, dict) else []
+    citations = [
+        SourceCitation(
+            source=str(c.get("source", "")).strip().lstrip("#").strip(),
+            excerpt=str(c.get("excerpt", "")).strip(),
+        )
+        for c in raw_citations
+        if isinstance(c, dict) and c.get("source") and c.get("excerpt")
+    ]
+    return str(draft).strip(), citations
+
+
+_PUNCTUATION_EQUIVALENTS = str.maketrans(
+    {"“": '"', "”": '"', "‘": "'", "’": "'", "–": "-", "—": "-", "…": "..."}
+)
+
+# An exact-substring check rejects a citation the moment the model reworks
+# even one word while quoting (common even when explicitly told not to),
+# hiding perfectly real citations. This threshold instead asks "how much of
+# the excerpt is verbatim, in order, in the source?" — tolerant of small
+# rewording, but a mostly-invented "quote" still won't reach it.
+_MIN_CITATION_OVERLAP_RATIO = 0.85
+
+
+def _normalize_for_matching(text: str) -> str:
+    return " ".join(text.lower().translate(_PUNCTUATION_EQUIVALENTS).split())
+
+
+def _citation_overlap_ratio(excerpt: str, context: str) -> float:
+    """Fraction of `excerpt` covered by (possibly non-contiguous, in-order)
+    matching runs against `context` — 1.0 for a verbatim quote, close to 0
+    for one the source doesn't support at all."""
+    if not excerpt:
+        return 0.0
+    matcher = difflib.SequenceMatcher(None, excerpt, context, autojunk=False)
+    matched_chars = sum(block.size for block in matcher.get_matching_blocks())
+    return matched_chars / len(excerpt)
+
+
+def _filter_verified_citations(
+    citations: list[SourceCitation], knowledge_context: str
+) -> list[SourceCitation]:
+    """Keeps only the citations whose excerpt is substantially verbatim in
+    the knowledge context sent to the model. A hallucinated or largely
+    invented "quote" is dropped rather than shown to staff as if it were
+    reliable — better to show fewer citations than a wrong one."""
+    normalized_context = _normalize_for_matching(knowledge_context)
+    kept = []
+    for citation in citations:
+        normalized_excerpt = _normalize_for_matching(citation.excerpt)
+        ratio = _citation_overlap_ratio(normalized_excerpt, normalized_context)
+        if ratio >= _MIN_CITATION_OVERLAP_RATIO:
+            kept.append(citation)
+        else:
+            logger.info(
+                "simulator_citation_dropped source=%r overlap_ratio=%.2f excerpt=%r",
+                citation.source,
+                ratio,
+                citation.excerpt,
+            )
+    return kept
 
 
 class ProcessingService:
@@ -193,17 +325,23 @@ class ProcessingService:
             company_documents_context=knowledge_context,
             email_thread_context="(Prueba de simulación, sin historial previo.)",
         )
+        rendered_prompt += _SOURCE_ATTRIBUTION_NOTE
 
         llm_response = self.llm_service.generate_draft(
             system_prompt=rendered_prompt,
             user_prompt=email_body,
             trace_name="walli-draft-simulation",
+            response_schema=_SIMULATOR_OUTPUT_SCHEMA,
         )
 
+        generated_body, sources_used = _parse_structured_simulator_output(llm_response.content)
+        sources_used = _filter_verified_citations(sources_used, knowledge_context)
+
         return SimulateDraftResponse(
-            generated_body=llm_response.content,
+            generated_body=generated_body,
             llm_provider=llm_response.provider,
             llm_model=llm_response.model,
+            sources_used=sources_used,
         )
 
     def _generate_and_store_draft(self, *, mailbox, email_message: EmailMessage, retry_count: int) -> Draft:
