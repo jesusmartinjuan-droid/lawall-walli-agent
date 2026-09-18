@@ -86,10 +86,6 @@ export default function SimulatorPage() {
                     El agente no citó ninguna fuente concreta para esta respuesta.
                   </p>
                 )}
-                <p className="page-subtitle" style={{ marginTop: 8 }}>
-                  Si una respuesta no es correcta, este es el documento y el fragmento que hay que
-                  revisar o ajustar.
-                </p>
               </div>
             </>
           ) : (
