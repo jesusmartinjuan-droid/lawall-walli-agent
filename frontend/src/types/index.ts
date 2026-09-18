@@ -155,10 +155,16 @@ export interface ProcessingDetail {
   logs: ProcessingLogItem[];
 }
 
+export interface SourceCitation {
+  source: string;
+  excerpt: string;
+}
+
 export interface SimulateDraftResponse {
   generated_body: string;
   llm_provider: string;
   llm_model: string;
+  sources_used: SourceCitation[];
   attached_image_id: number | null;
   attached_image_name: string | null;
 }

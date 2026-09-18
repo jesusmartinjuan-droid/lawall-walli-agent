@@ -13,6 +13,7 @@ The other public methods (`list_processing`, `get_processing_detail`) back the
 draft-history and processing-detail screens.
 """
 
+import difflib
 import json
 from datetime import UTC, datetime
 
@@ -32,7 +33,12 @@ from app.repositories.email_repository import EmailMessageRepository, EmailThrea
 from app.repositories.llm_trace_repository import LLMTraceRepository
 from app.repositories.mailbox_repository import MailboxRepository
 from app.repositories.processing_log_repository import ProcessingLogRepository
-from app.schemas.processing import ProcessingDetail, ProcessingListItem, SimulateDraftResponse
+from app.schemas.processing import (
+    ProcessingDetail,
+    ProcessingListItem,
+    SimulateDraftResponse,
+    SourceCitation,
+)
 from app.services.agent_image_service import AgentImageService
 from app.services.document_service import DocumentService
 from app.services.email_provider_service import FetchedEmail, InlineImage
@@ -83,10 +89,52 @@ def _inject(template: str, placeholder: str, fallback_title: str, value: str) ->
 
 _NO_IMAGE = "ninguna"
 
+_SOURCE_ATTRIBUTION_NOTE = """
+
+============================================================
+NOTA SOLO PARA ESTA PRUEBA (no forma parte del prompt real; nunca la apliques a un correo de verdad)
+============================================================
+
+Además del borrador, debes devolver, por cada afirmación concreta que se apoye en una fuente, el \
+nombre exacto de esa fuente (tal y como aparece precedido de "###" entre las fuentes vigentes) y un \
+fragmento literal, textual, de una o dos frases, copiado tal cual de esa fuente — nunca lo \
+parafrasees ni lo inventes. Si no te has apoyado en ninguna fuente concreta, deja esa lista vacía.
+"""
+
+_DRAFT_FIELD_SCHEMA = {
+    "type": "string",
+    "description": (
+        "El borrador de respuesta para el cliente, exactamente como se entregaría. Si "
+        '`image_name` no es "ninguna", NO escribas de nuevo en texto los datos que esa '
+        "imagen ya muestra (p. ej. un desglose de precios por m²) — mostrar la imagen ya "
+        "cumple cualquier obligación de incluir ese dato, no hace falta repetirlo."
+    ),
+}
+
+_CITATIONS_FIELD_SCHEMA = {
+    "type": "array",
+    "description": "Fuentes concretas usadas para fundamentar el borrador, con su cita literal.",
+    "items": {
+        "type": "object",
+        "properties": {
+            "source": {
+                "type": "string",
+                "description": 'Nombre exacto de la fuente, tal y como aparece precedido de "###".',
+            },
+            "excerpt": {
+                "type": "string",
+                "description": "Fragmento literal, copiado tal cual de esa fuente.",
+            },
+        },
+        "required": ["source", "excerpt"],
+        "additionalProperties": False,
+    },
+}
+
 
 def _build_draft_schema(image_schema_property: dict) -> dict:
-    """The structured-output schema for real/simulated draft generation:
-    which configured image (if any) to attach, plus the draft text. Deciding
+    """The structured-output schema for real draft generation: which
+    configured image (if any) to attach, plus the draft text. Deciding
     `image_name` FIRST (schema property order) lets the model condition the
     draft text on that decision — e.g. skip repeating a price breakdown in
     text once it has already committed to attaching the image that shows it
@@ -98,17 +146,26 @@ def _build_draft_schema(image_schema_property: dict) -> dict:
         "type": "object",
         "properties": {
             "image_name": image_schema_property,
-            "draft": {
-                "type": "string",
-                "description": (
-                    "El borrador de respuesta para el cliente, exactamente como se entregaría. Si "
-                    '`image_name` no es "ninguna", NO escribas de nuevo en texto los datos que esa '
-                    "imagen ya muestra (p. ej. un desglose de precios por m²) — mostrar la imagen ya "
-                    "cumple cualquier obligación de incluir ese dato, no hace falta repetirlo."
-                ),
-            },
+            "draft": _DRAFT_FIELD_SCHEMA,
         },
         "required": ["image_name", "draft"],
+        "additionalProperties": False,
+    }
+
+
+def _build_simulator_schema(image_schema_property: dict) -> dict:
+    """The Simulador's structured-output schema: same image-selection as
+    real generation, plus the source citations behind the draft — richer
+    than `_build_draft_schema` since the Simulador is also where staff
+    verify *why* the agent answered as it did, not just preview the email."""
+    return {
+        "type": "object",
+        "properties": {
+            "image_name": image_schema_property,
+            "draft": _DRAFT_FIELD_SCHEMA,
+            "citations": _CITATIONS_FIELD_SCHEMA,
+        },
+        "required": ["image_name", "draft", "citations"],
         "additionalProperties": False,
     }
 
@@ -144,11 +201,11 @@ IMÁGENES DISPONIBLES PARA ADJUNTAR (elige el nombre EXACTO en "image_name" si c
 
 
 def _parse_draft_with_image(raw: str) -> tuple[str, str | None]:
-    """Parses the {"draft": ..., "image_name": ...} structured output into
-    (draft_text, chosen_image_name_or_None). Falls back to (raw, None) if the
-    response isn't valid JSON (e.g. a provider that ignores
-    `response_schema`), so a malformed response never breaks generation —
-    it just means no image gets attached."""
+    """Parses the {"image_name": ..., "draft": ...} structured output (real
+    generation) into (draft_text, chosen_image_name_or_None). Falls back to
+    (raw, None) if the response isn't valid JSON (e.g. a provider that
+    ignores `response_schema`), so a malformed response never breaks
+    generation — it just means no image gets attached."""
     try:
         payload = json.loads(raw)
     except (json.JSONDecodeError, TypeError):
@@ -161,6 +218,90 @@ def _parse_draft_with_image(raw: str) -> tuple[str, str | None]:
     if not image_name or image_name == _NO_IMAGE:
         image_name = None
     return draft, image_name
+
+
+def _parse_simulator_output(raw: str) -> tuple[str, str | None, list[SourceCitation]]:
+    """Parses the Simulador's {"image_name", "draft", "citations"}
+    structured output into (draft_text, chosen_image_name_or_None,
+    citations). Falls back to (raw, None, []) if the response isn't valid
+    JSON, so a malformed response never breaks the screen. Callers should
+    run the citations through `_filter_verified_citations` before showing
+    them — the model self-reports these, so they aren't guaranteed accurate
+    yet."""
+    try:
+        payload = json.loads(raw)
+    except (json.JSONDecodeError, TypeError):
+        return raw.strip(), None, []
+    if not isinstance(payload, dict):
+        return raw.strip(), None, []
+
+    draft = str(payload.get("draft", raw)).strip()
+
+    image_name = payload.get("image_name")
+    if not image_name or image_name == _NO_IMAGE:
+        image_name = None
+
+    raw_citations = payload.get("citations", [])
+    citations = [
+        SourceCitation(
+            source=str(c.get("source", "")).strip().lstrip("#").strip(),
+            excerpt=str(c.get("excerpt", "")).strip(),
+        )
+        for c in raw_citations
+        if isinstance(c, dict) and c.get("source") and c.get("excerpt")
+    ]
+    return draft, image_name, citations
+
+
+_PUNCTUATION_EQUIVALENTS = str.maketrans(
+    {"“": '"', "”": '"', "‘": "'", "’": "'", "–": "-", "—": "-", "…": "..."}
+)
+
+# An exact-substring check rejects a citation the moment the model reworks
+# even one word while quoting (common even when explicitly told not to),
+# hiding perfectly real citations. This threshold instead asks "how much of
+# the excerpt is verbatim, in order, in the source?" — tolerant of small
+# rewording, but a mostly-invented "quote" still won't reach it.
+_MIN_CITATION_OVERLAP_RATIO = 0.85
+
+
+def _normalize_for_matching(text: str) -> str:
+    return " ".join(text.lower().translate(_PUNCTUATION_EQUIVALENTS).split())
+
+
+def _citation_overlap_ratio(excerpt: str, context: str) -> float:
+    """Fraction of `excerpt` covered by (possibly non-contiguous, in-order)
+    matching runs against `context` — 1.0 for a verbatim quote, close to 0
+    for one the source doesn't support at all."""
+    if not excerpt:
+        return 0.0
+    matcher = difflib.SequenceMatcher(None, excerpt, context, autojunk=False)
+    matched_chars = sum(block.size for block in matcher.get_matching_blocks())
+    return matched_chars / len(excerpt)
+
+
+def _filter_verified_citations(
+    citations: list[SourceCitation], knowledge_context: str
+) -> list[SourceCitation]:
+    """Keeps only the citations whose excerpt is substantially verbatim in
+    the knowledge context sent to the model. A hallucinated or largely
+    invented "quote" is dropped rather than shown to staff as if it were
+    reliable — better to show fewer citations than a wrong one."""
+    normalized_context = _normalize_for_matching(knowledge_context)
+    kept = []
+    for citation in citations:
+        normalized_excerpt = _normalize_for_matching(citation.excerpt)
+        ratio = _citation_overlap_ratio(normalized_excerpt, normalized_context)
+        if ratio >= _MIN_CITATION_OVERLAP_RATIO:
+            kept.append(citation)
+        else:
+            logger.info(
+                "simulator_citation_dropped source=%r overlap_ratio=%.2f excerpt=%r",
+                citation.source,
+                ratio,
+                citation.excerpt,
+            )
+    return kept
 
 
 class ProcessingService:
@@ -279,13 +420,12 @@ class ProcessingService:
             company_documents_context=knowledge_context,
             email_thread_context="(Prueba de simulación, sin historial previo.)",
         )
+        rendered_prompt += _SOURCE_ATTRIBUTION_NOTE
 
-        response_schema = None
-        if settings.enable_agent_image_embedding:
-            agent_images = self.agent_image_service.list_all()
-            image_schema_property, image_note = _build_agent_image_selection(agent_images)
-            rendered_prompt += image_note
-            response_schema = _build_draft_schema(image_schema_property)
+        agent_images = self.agent_image_service.list_all() if settings.enable_agent_image_embedding else []
+        image_schema_property, image_note = _build_agent_image_selection(agent_images)
+        rendered_prompt += image_note
+        response_schema = _build_simulator_schema(image_schema_property)
 
         llm_response = self.llm_service.generate_draft(
             system_prompt=rendered_prompt,
@@ -294,18 +434,17 @@ class ProcessingService:
             response_schema=response_schema,
         )
 
-        generated_body = llm_response.content
-        attached_image = None
-        if response_schema is not None:
-            generated_body, chosen_image_name = _parse_draft_with_image(llm_response.content)
-            attached_image = (
-                self.agent_image_service.get_by_name(chosen_image_name) if chosen_image_name else None
-            )
+        generated_body, chosen_image_name, sources_used = _parse_simulator_output(llm_response.content)
+        sources_used = _filter_verified_citations(sources_used, knowledge_context)
+        attached_image = (
+            self.agent_image_service.get_by_name(chosen_image_name) if chosen_image_name else None
+        )
 
         return SimulateDraftResponse(
             generated_body=generated_body,
             llm_provider=llm_response.provider,
             llm_model=llm_response.model,
+            sources_used=sources_used,
             attached_image_id=attached_image.id if attached_image else None,
             attached_image_name=attached_image.name if attached_image else None,
         )

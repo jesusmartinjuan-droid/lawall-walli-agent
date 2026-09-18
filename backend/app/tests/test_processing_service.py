@@ -173,6 +173,7 @@ def test_simulate_draft_returns_generated_text_without_persisting_anything(db_se
     assert result.generated_body
     assert result.llm_provider == "mock"
     assert result.llm_model == "mock-1"
+    assert result.sources_used == []
 
     assert db_session.scalar(select(func.count()).select_from(EmailMessage)) == 0
     assert db_session.scalar(select(func.count()).select_from(Draft)) == 0
@@ -412,3 +413,160 @@ def test_generate_and_store_draft_skips_image_selection_when_disabled(db_session
     assert captured_kwargs["response_schema"] is None
     draft = service.drafts.get_by_email_message_id(message.id)
     assert draft.agent_image_id is None
+
+
+def test_parse_simulator_output_extracts_draft_image_and_citations():
+    import json
+
+    from app.services.processing_service import _parse_simulator_output
+
+    raw = json.dumps(
+        {
+            "draft": "Hola, aquí tienes tu respuesta.",
+            "image_name": "ninguna",
+            "citations": [
+                {
+                    "source": "### Manual Maestro",
+                    "excerpt": "250 metros se interpretan como metros cuadrados.",
+                },
+                {"source": "Condiciones Generales", "excerpt": "El molde sigue siendo propiedad de laWALL."},
+            ],
+        }
+    )
+    body, image_name, citations = _parse_simulator_output(raw)
+
+    assert body == "Hola, aquí tienes tu respuesta."
+    assert image_name is None
+    assert [(c.source, c.excerpt) for c in citations] == [
+        ("Manual Maestro", "250 metros se interpretan como metros cuadrados."),
+        ("Condiciones Generales", "El molde sigue siendo propiedad de laWALL."),
+    ]
+
+
+def test_parse_simulator_output_extracts_the_chosen_image():
+    import json
+
+    from app.services.processing_service import _parse_simulator_output
+
+    raw = json.dumps({"draft": "Aquí tienes la tabla.", "image_name": "Tabla ES", "citations": []})
+    body, image_name, citations = _parse_simulator_output(raw)
+
+    assert body == "Aquí tienes la tabla."
+    assert image_name == "Tabla ES"
+    assert citations == []
+
+
+def test_parse_simulator_output_falls_back_to_raw_text_on_invalid_json():
+    from app.services.processing_service import _parse_simulator_output
+
+    body, image_name, citations = _parse_simulator_output("Esto no es JSON en absoluto.")
+
+    assert body == "Esto no es JSON en absoluto."
+    assert image_name is None
+    assert citations == []
+
+
+def test_parse_simulator_output_ignores_incomplete_citation_entries():
+    import json
+
+    from app.services.processing_service import _parse_simulator_output
+
+    raw = json.dumps(
+        {
+            "draft": "Hola.",
+            "image_name": "ninguna",
+            "citations": [{"source": "Manual Maestro"}, {"excerpt": "sin fuente"}, {}],
+        }
+    )
+    body, image_name, citations = _parse_simulator_output(raw)
+
+    assert body == "Hola."
+    assert citations == []
+
+
+def test_filter_verified_citations_drops_excerpts_not_present_in_the_context():
+    from app.schemas.processing import SourceCitation
+    from app.services.processing_service import _filter_verified_citations
+
+    context = "### Manual Maestro\n250 metros se interpretan como metros cuadrados.\n"
+    citations = [
+        SourceCitation(source="Manual Maestro", excerpt="250 metros se interpretan como metros cuadrados."),
+        SourceCitation(source="Manual Maestro", excerpt="Esto no aparece en ningún sitio."),
+    ]
+
+    kept = _filter_verified_citations(citations, context)
+
+    assert [(c.source, c.excerpt) for c in kept] == [
+        ("Manual Maestro", "250 metros se interpretan como metros cuadrados.")
+    ]
+
+
+def test_filter_verified_citations_tolerates_minor_rewording_by_the_model():
+    from app.schemas.processing import SourceCitation
+    from app.services.processing_service import _filter_verified_citations
+
+    context = "El molde fabricado por encargo del cliente sigue siendo propiedad de laWALL."
+    citations = [
+        SourceCitation(
+            source="Condiciones",
+            # Model added "es y" while quoting — a single small rewording,
+            # not a fabrication.
+            excerpt="El molde fabricado por encargo del cliente es y sigue siendo propiedad de laWALL.",
+        ),
+    ]
+
+    kept = _filter_verified_citations(citations, context)
+
+    assert len(kept) == 1
+
+
+def test_filter_verified_citations_still_drops_mostly_invented_excerpts():
+    from app.schemas.processing import SourceCitation
+    from app.services.processing_service import _filter_verified_citations
+
+    context = "El molde fabricado por encargo del cliente sigue siendo propiedad de laWALL."
+    citations = [
+        SourceCitation(
+            source="Condiciones",
+            excerpt="laWALL garantiza la exclusividad del diseño durante cinco años tras la entrega.",
+        ),
+    ]
+
+    kept = _filter_verified_citations(citations, context)
+
+    assert kept == []
+
+
+def test_simulate_draft_drops_citations_that_cannot_be_verified(db_session):
+    import json
+
+    from app.services.llm_service import LLMResponse
+
+    service = ProcessingService(db_session)
+    canned = json.dumps(
+        {
+            "draft": "Hola,\n\nGracias por tu consulta.",
+            "image_name": "ninguna",
+            "citations": [
+                {"source": "Manual Maestro", "excerpt": "esto no está en la base de conocimiento activa"}
+            ],
+        }
+    )
+    captured_kwargs = {}
+
+    def _fake_generate_draft(**kwargs):
+        captured_kwargs.update(kwargs)
+        return LLMResponse(
+            content=canned, provider="mock", model="mock-1", input_tokens=10, output_tokens=10, latency_ms=1
+        )
+
+    service.llm_service.generate_draft = _fake_generate_draft
+
+    result = service.simulate_draft("¿Qué tamaño tienen las planchas?")
+
+    assert captured_kwargs["response_schema"] is not None
+    assert result.generated_body == "Hola,\n\nGracias por tu consulta."
+    # No active documents/sources are loaded in this test's DB, so the
+    # self-reported excerpt can never verify against an (empty) knowledge
+    # context and must be dropped rather than shown as unreliable.
+    assert result.sources_used == []
