@@ -112,6 +112,15 @@ class EmailProvider(ABC):
 
 _NO_TEXT_BODY_PLACEHOLDER = "(Correo original sin contenido de texto.)"
 
+# A literal marker the model is instructed (see `_DRAFT_FIELD_SCHEMA` in
+# processing_service.py) to place inside the draft text at the exact point
+# where an attached image should appear — normally right after the sentence
+# that mentions it, before any closing/sign-off — instead of always at the
+# very end of the reply. Kept here (not in processing_service.py) since this
+# module owns email body construction; processing_service.py imports it so
+# both sides always agree on the exact literal.
+IMAGE_PLACEHOLDER = "[[IMAGEN]]"
+
 
 def _build_reply_bodies(
     *, generated_reply: str, original: FetchedEmail, inline_image_cid: str | None = None
@@ -122,15 +131,36 @@ def _build_reply_bodies(
     webmail) uses when you hit Reply, so the draft looks the same either way.
 
     `inline_image_cid` (bare, no angle brackets) places an <img> referencing
-    that Content-ID right after the reply text — the caller is responsible
-    for actually attaching the corresponding part via `add_related`."""
+    that Content-ID at the position marked by `IMAGE_PLACEHOLDER` in
+    `generated_reply`, if present — the caller is responsible for actually
+    attaching the corresponding part via `add_related`. Falls back to placing
+    it right after all the reply text if the model didn't include the
+    marker, so a missing marker never breaks image placement entirely."""
     attribution = f"El {original.received_at.strftime('%Y-%m-%d %H:%M')}, {original.sender} escribió:"
 
-    quoted_text = "\n".join(f"> {line}" for line in (original.body_text or "").splitlines())
-    plain_body = f"{generated_reply}\n\n{attribution}\n\n{quoted_text or '> ' + _NO_TEXT_BODY_PLACEHOLDER}"
+    has_marker = IMAGE_PLACEHOLDER in generated_reply
+    if has_marker:
+        before, _, after = generated_reply.partition(IMAGE_PLACEHOLDER)
+        before, after = before.strip(), after.strip()
+        clean_reply = "\n\n".join(part for part in (before, after) if part)
+    else:
+        before, after = generated_reply.strip(), ""
+        clean_reply = before
 
-    reply_html = html_lib.escape(generated_reply).replace("\n", "<br>")
+    quoted_text = "\n".join(f"> {line}" for line in (original.body_text or "").splitlines())
+    plain_body = f"{clean_reply}\n\n{attribution}\n\n{quoted_text or '> ' + _NO_TEXT_BODY_PLACEHOLDER}"
+
+    def _to_html_paragraph(text: str) -> str:
+        return f"<p>{html_lib.escape(text).replace(chr(10), '<br>')}</p>" if text else ""
+
     image_html = f'<p><img src="cid:{inline_image_cid}"></p>' if inline_image_cid else ""
+    if inline_image_cid and has_marker:
+        reply_section_html = f"{_to_html_paragraph(before)}{image_html}{_to_html_paragraph(after)}"
+    elif inline_image_cid:
+        reply_section_html = f"{_to_html_paragraph(clean_reply)}{image_html}"
+    else:
+        reply_section_html = _to_html_paragraph(clean_reply)
+
     if original.body_html:
         quoted_html = original.body_html
     elif original.body_text:
@@ -138,8 +168,7 @@ def _build_reply_bodies(
     else:
         quoted_html = html_lib.escape(_NO_TEXT_BODY_PLACEHOLDER)
     html_body = (
-        f"<p>{reply_html}</p>{image_html}"
-        f"<p>{html_lib.escape(attribution)}</p><blockquote>{quoted_html}</blockquote>"
+        f"{reply_section_html}<p>{html_lib.escape(attribution)}</p><blockquote>{quoted_html}</blockquote>"
     )
 
     return plain_body, html_body

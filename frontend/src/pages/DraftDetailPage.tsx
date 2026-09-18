@@ -83,7 +83,9 @@ export default function DraftDetailPage() {
             <summary>Borrador generado</summary>
             {data.generated_body ? (
               <>
-                <pre className="detail-content">{data.generated_body}</pre>
+                <pre className="detail-content">
+                  {data.generated_body.replace("[[IMAGEN]]", "\n[Imagen incrustada aquí]\n")}
+                </pre>
                 {data.draft_status && (
                   <p className="page-subtitle" style={{ marginTop: 8 }}>
                     Estado del borrador: <StatusBadge status={data.draft_status} />

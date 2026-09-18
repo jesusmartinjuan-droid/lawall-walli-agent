@@ -10,10 +10,29 @@ const EXAMPLE_EMAIL =
   "Buenos días,\n\nQueríamos saber si tenéis disponibilidad para un pedido de revestimientos " +
   "para un local comercial, y si nos podéis pasar precios orientativos.\n\nGracias, un saludo.";
 
+// Must match `IMAGE_PLACEHOLDER` in backend/app/services/email_provider_service.py —
+// the literal marker the model places in the draft text at the point where
+// the image should appear, so it doesn't always land at the very end.
+const IMAGE_PLACEHOLDER = "[[IMAGEN]]";
+
+function TextBlock({ text }: { text: string }) {
+  if (!text) return null;
+  return (
+    <p style={{ margin: 0 }}>
+      {text.split("\n").map((line, index, lines) => (
+        <span key={index}>
+          {line}
+          {index < lines.length - 1 && <br />}
+        </span>
+      ))}
+    </p>
+  );
+}
+
 // Mirrors the exact structure `_build_reply_bodies` puts in the real HTML
-// email — the reply text as a paragraph with line breaks, then the image
-// (if any) right after it — so what staff see here is what the customer
-// would actually see, not an approximation.
+// email — the reply text split around the image marker (if the model placed
+// one), with the image rendered at that same point, so what staff see here
+// is what the customer would actually see, not an approximation.
 function EmailBodyPreview({
   generatedBody,
   imageId,
@@ -46,6 +65,21 @@ function EmailBodyPreview({
     };
   }, [imageId]);
 
+  const hasMarker = generatedBody.includes(IMAGE_PLACEHOLDER);
+  const [before, after] = hasMarker
+    ? generatedBody.split(IMAGE_PLACEHOLDER).map((part) => part.trim())
+    : [generatedBody, ""];
+
+  const imageBlock = imageId !== null && (
+    <p style={{ margin: "12px 0" }}>
+      {previewUrl ? (
+        <img src={previewUrl} alt={imageName ?? ""} style={{ maxWidth: "100%" }} />
+      ) : (
+        <span className="page-subtitle">Cargando imagen…</span>
+      )}
+    </p>
+  );
+
   return (
     <div
       style={{
@@ -55,22 +89,14 @@ function EmailBodyPreview({
         background: "var(--color-surface)",
       }}
     >
-      <p style={{ margin: 0 }}>
-        {generatedBody.split("\n").map((line, index, lines) => (
-          <span key={index}>
-            {line}
-            {index < lines.length - 1 && <br />}
-          </span>
-        ))}
-      </p>
-      {imageId !== null && (
-        <p style={{ margin: "12px 0 0" }}>
-          {previewUrl ? (
-            <img src={previewUrl} alt={imageName ?? ""} style={{ maxWidth: "100%" }} />
-          ) : (
-            <span className="page-subtitle">Cargando imagen…</span>
-          )}
-        </p>
+      <TextBlock text={before} />
+      {hasMarker ? (
+        <>
+          {imageBlock}
+          <TextBlock text={after} />
+        </>
+      ) : (
+        imageBlock
       )}
     </div>
   );

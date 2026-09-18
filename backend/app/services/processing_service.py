@@ -41,7 +41,7 @@ from app.schemas.processing import (
 )
 from app.services.agent_image_service import AgentImageService
 from app.services.document_service import DocumentService
-from app.services.email_provider_service import FetchedEmail, InlineImage
+from app.services.email_provider_service import IMAGE_PLACEHOLDER, FetchedEmail, InlineImage
 from app.services.knowledge_context_service import KnowledgeContextService
 from app.services.llm_service import LLMProviderError, LLMService
 from app.services.mailbox_service import build_email_provider
@@ -105,9 +105,14 @@ _DRAFT_FIELD_SCHEMA = {
     "type": "string",
     "description": (
         "El borrador de respuesta para el cliente, exactamente como se entregaría. Si "
-        '`image_name` no es "ninguna", NO escribas de nuevo en texto los datos que esa '
+        '`image_name` no es "ninguna": (1) NO escribas de nuevo en texto los datos que esa '
         "imagen ya muestra (p. ej. un desglose de precios por m²) — mostrar la imagen ya "
-        "cumple cualquier obligación de incluir ese dato, no hace falta repetirlo."
+        "cumple cualquier obligación de incluir ese dato, no hace falta repetirlo; (2) inserta "
+        f'el marcador literal "{IMAGE_PLACEHOLDER}" en el punto exacto del texto donde debe '
+        "aparecer la imagen — normalmente justo después de la frase que la menciona, y SIEMPRE "
+        "antes de la despedida/firma final, para que la imagen no quede colgada al final del "
+        f'correo tras el saludo de cierre. No incluyas "{IMAGE_PLACEHOLDER}" si `image_name` es '
+        '"ninguna".'
     ),
 }
 
