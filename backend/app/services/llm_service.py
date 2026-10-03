@@ -9,6 +9,7 @@ structured JSON output anywhere in this pipeline anymore.
 
 from __future__ import annotations
 
+import re
 import time
 from abc import ABC, abstractmethod
 from dataclasses import dataclass, field
@@ -19,6 +20,32 @@ from app.core.retry import with_retry
 from app.services import langfuse_client
 
 logger = get_logger(__name__)
+
+# How many times to retry a 429 specifically, waiting exactly as long as
+# OpenAI's own error tells us to — not our generic exponential backoff,
+# which can be badly wrong for a token-per-minute limit: too short to let
+# the window refill, or needlessly long when OpenAI already says "855ms".
+_MAX_RATE_LIMIT_RETRIES = 5
+_DEFAULT_RATE_LIMIT_WAIT_SECONDS = 2.0
+_RETRY_AFTER_PATTERN = re.compile(r"try again in (\d+(?:\.\d+)?)\s*(ms|s)\b", re.IGNORECASE)
+
+
+def _seconds_to_wait_for_rate_limit(exc) -> float:
+    """Prefers the `retry-after` response header (seconds); falls back to
+    parsing OpenAI's "Please try again in Xms/Xs" message text, then to a
+    conservative default if neither is present."""
+    response = getattr(exc, "response", None)
+    retry_after = response.headers.get("retry-after") if response is not None else None
+    if retry_after:
+        try:
+            return float(retry_after)
+        except ValueError:
+            pass
+    match = _RETRY_AFTER_PATTERN.search(str(exc))
+    if match:
+        value, unit = match.groups()
+        return float(value) / 1000 if unit.lower() == "ms" else float(value)
+    return _DEFAULT_RATE_LIMIT_WAIT_SECONDS
 
 
 @dataclass
@@ -85,22 +112,39 @@ class OpenAILLMProvider(LLMProvider):
         file_ids = file_ids or []
 
         def _call():
+            from openai import RateLimitError
+
             client = self._client()
             tools: list[dict] = [{"type": "web_search"}]
             if file_ids:
                 tools.append(
                     {"type": "code_interpreter", "container": {"type": "auto", "file_ids": file_ids}}
                 )
-            # No `temperature`: gpt-5.6-sol (and the rest of this reasoning-tier
-            # family) rejects it outright ("Unsupported parameter") — confirmed
-            # against the real API, not an assumption.
-            return client.responses.create(
-                model=self.model,
-                max_output_tokens=self.max_tokens,
-                instructions=instructions,
-                input=input_text,
-                tools=tools,
-            )
+
+            for attempt in range(_MAX_RATE_LIMIT_RETRIES):
+                try:
+                    # No `temperature`: gpt-5.6-sol (and the rest of this
+                    # reasoning-tier family) rejects it outright ("Unsupported
+                    # parameter") — confirmed against the real API.
+                    return client.responses.create(
+                        model=self.model,
+                        max_output_tokens=self.max_tokens,
+                        instructions=instructions,
+                        input=input_text,
+                        tools=tools,
+                    )
+                except RateLimitError as exc:
+                    wait_s = _seconds_to_wait_for_rate_limit(exc)
+                    logger.warning(
+                        "openai_rate_limited model=%s attempt=%s/%s wait_s=%.2f",
+                        self.model,
+                        attempt + 1,
+                        _MAX_RATE_LIMIT_RETRIES,
+                        wait_s,
+                    )
+                    time.sleep(wait_s)
+                    last_exc = exc
+            raise last_exc
 
         started = time.monotonic()
         response = with_retry(_call, exceptions=(Exception,))

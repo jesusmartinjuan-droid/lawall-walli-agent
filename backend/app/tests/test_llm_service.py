@@ -1,10 +1,13 @@
 from types import SimpleNamespace
 
+import pytest
+
 from app.services.llm_service import (
     LLMService,
     MockLLMProvider,
     OpenAILLMProvider,
     _extract_generated_images,
+    _seconds_to_wait_for_rate_limit,
 )
 
 
@@ -58,6 +61,64 @@ def test_openai_provider_extracts_code_interpreter_snippets_and_web_search_queri
     assert response.web_search_queries == ["la-wall.com plazos de entrega"]
     assert response.input_tokens == 10
     assert response.output_tokens == 5
+
+
+def _fake_rate_limit_error(*, message: str, headers: dict | None = None):
+    import httpx
+    from openai import RateLimitError
+
+    request = httpx.Request("POST", "https://api.openai.com/v1/responses")
+    response = httpx.Response(429, headers=headers or {}, request=request)
+    return RateLimitError(message, response=response, body=None)
+
+
+def test_seconds_to_wait_prefers_retry_after_header():
+    exc = _fake_rate_limit_error(message="rate limited", headers={"retry-after": "3.5"})
+    assert _seconds_to_wait_for_rate_limit(exc) == 3.5
+
+
+def test_seconds_to_wait_falls_back_to_parsing_message_milliseconds():
+    exc = _fake_rate_limit_error(message="Please try again in 855ms.")
+    assert _seconds_to_wait_for_rate_limit(exc) == pytest.approx(0.855)
+
+
+def test_seconds_to_wait_falls_back_to_parsing_message_seconds():
+    exc = _fake_rate_limit_error(message="Please try again in 2.5s.")
+    assert _seconds_to_wait_for_rate_limit(exc) == pytest.approx(2.5)
+
+
+def test_seconds_to_wait_defaults_when_nothing_is_present():
+    exc = _fake_rate_limit_error(message="rate limited, no timing info")
+    assert _seconds_to_wait_for_rate_limit(exc) == 2.0
+
+
+def test_generate_recovers_from_a_rate_limit_by_waiting_and_retrying(monkeypatch):
+    sleeps = []
+    monkeypatch.setattr("app.services.llm_service.time.sleep", lambda s: sleeps.append(s))
+
+    fake_response = SimpleNamespace(
+        output_text="Ya va.",
+        usage=SimpleNamespace(input_tokens=1, output_tokens=1),
+        output=[],
+    )
+    attempts = {"count": 0}
+
+    def _create(**kwargs):
+        attempts["count"] += 1
+        if attempts["count"] == 1:
+            raise _fake_rate_limit_error(message="try again in 10ms")
+        return fake_response
+
+    provider = OpenAILLMProvider(api_key="sk-test", model="gpt-5.6-terra", max_tokens=1000)
+    monkeypatch.setattr(
+        provider, "_client", lambda: SimpleNamespace(responses=SimpleNamespace(create=_create))
+    )
+
+    response = provider.generate(instructions="system", input_text="Hola")
+
+    assert response.content == "Ya va."
+    assert attempts["count"] == 2
+    assert sleeps == [pytest.approx(0.01)]
 
 
 class _FakeContainerFile:
