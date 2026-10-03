@@ -50,3 +50,10 @@ backend/app/db/migrations/versions/__pycache__/
 # Logs
 *.log
 logs/
+
+# Local experiments / client files, never committed
+documentos/
+*.ipynb
+.ipynb_checkpoints/
+real_prompt.txt
+*.pdf

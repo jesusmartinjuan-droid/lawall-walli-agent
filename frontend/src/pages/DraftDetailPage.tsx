@@ -47,9 +47,9 @@ export default function DraftDetailPage() {
           </details>
 
           <details className="detail-section">
-            <summary>Documentos incluidos en el contexto</summary>
+            <summary>Archivos locales adjuntados</summary>
             {data.documents_used.length === 0 ? (
-              <p className="page-subtitle">No se incluyeron documentos.</p>
+              <p className="page-subtitle">No se adjuntó ningún archivo local.</p>
             ) : (
               <ul>
                 {data.documents_used.map((name) => (
@@ -60,9 +60,9 @@ export default function DraftDetailPage() {
           </details>
 
           <details className="detail-section">
-            <summary>Sitios web incluidos en el contexto</summary>
+            <summary>Archivos de Drive adjuntados</summary>
             {data.web_sources_used.length === 0 ? (
-              <p className="page-subtitle">No se incluyó ninguna web.</p>
+              <p className="page-subtitle">No se adjuntó ningún archivo de Drive.</p>
             ) : (
               <ul>
                 {data.web_sources_used.map((name) => (
@@ -83,9 +83,7 @@ export default function DraftDetailPage() {
             <summary>Borrador generado</summary>
             {data.generated_body ? (
               <>
-                <pre className="detail-content">
-                  {data.generated_body.replace("[[IMAGEN]]", "\n[Imagen incrustada aquí]\n")}
-                </pre>
+                <pre className="detail-content">{data.generated_body}</pre>
                 {data.draft_status && (
                   <p className="page-subtitle" style={{ marginTop: 8 }}>
                     Estado del borrador: <StatusBadge status={data.draft_status} />

@@ -9,7 +9,10 @@ class DocumentResponse(BaseModel):
     original_filename: str
     content_type: str
     is_active: bool
-    text_length: int = 0
+    size_bytes: int
+    openai_file_id: str | None
+    openai_file_uploaded_at: datetime | None
+    openai_upload_error: str | None
     created_at: datetime
     updated_at: datetime
 

@@ -4,7 +4,8 @@ from sqlalchemy.orm import Session
 from app.api.deps import get_current_user, get_db
 from app.models.user import User
 from app.schemas.document import DocumentResponse
-from app.services.document_service import DocumentService, UnsupportedDocumentTypeError
+from app.services.document_service import DocumentService
+from app.services.openai_file_service import FileTooLargeError, UnsupportedFileTypeError
 
 router = APIRouter(prefix="/api/documents", tags=["documents"])
 
@@ -16,7 +17,10 @@ def _to_response(document) -> DocumentResponse:
         original_filename=document.original_filename,
         content_type=document.content_type,
         is_active=document.is_active,
-        text_length=len(document.extracted_text or ""),
+        size_bytes=document.size_bytes,
+        openai_file_id=document.openai_file_id,
+        openai_file_uploaded_at=document.openai_file_uploaded_at,
+        openai_upload_error=document.openai_upload_error,
         created_at=document.created_at,
         updated_at=document.updated_at,
     )
@@ -39,7 +43,7 @@ async def upload_document(
             content_type=file.content_type or "application/octet-stream",
             file_bytes=file_bytes,
         )
-    except UnsupportedDocumentTypeError as exc:
+    except (UnsupportedFileTypeError, FileTooLargeError) as exc:
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(exc)) from exc
     return _to_response(document)
 

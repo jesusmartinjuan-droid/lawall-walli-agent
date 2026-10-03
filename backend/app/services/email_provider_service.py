@@ -28,6 +28,8 @@ from email.header import decode_header
 from email.message import EmailMessage as PyEmailMessage
 from email.utils import make_msgid, parsedate_to_datetime
 
+import markdown as markdown_lib
+
 from app.core.logging import get_logger
 from app.core.retry import with_retry
 
@@ -72,16 +74,6 @@ class DraftCreationResult:
     message: str
 
 
-@dataclass
-class InlineImage:
-    """An image to embed inline (not as a file attachment) in a generated
-    reply, via a Content-ID referenced from the HTML body."""
-
-    content: bytes
-    content_type: str
-    filename: str
-
-
 class EmailProviderError(Exception):
     pass
 
@@ -104,62 +96,49 @@ class EmailProvider(ABC):
         establish the baseline for a newly connected mailbox."""
 
     @abstractmethod
-    def create_draft(
-        self, *, subject: str, body: str, in_reply_to: FetchedEmail, inline_image: InlineImage | None = None
-    ) -> DraftCreationResult:
+    def create_draft(self, *, subject: str, body: str, in_reply_to: FetchedEmail) -> DraftCreationResult:
         """Best-effort creation of a draft reply in the mailbox's drafts folder."""
 
 
 _NO_TEXT_BODY_PLACEHOLDER = "(Correo original sin contenido de texto.)"
 
-# A literal marker the model is instructed (see `_DRAFT_FIELD_SCHEMA` in
-# processing_service.py) to place inside the draft text at the exact point
-# where an attached image should appear — normally right after the sentence
-# that mentions it, before any closing/sign-off — instead of always at the
-# very end of the reply. Kept here (not in processing_service.py) since this
-# module owns email body construction; processing_service.py imports it so
-# both sides always agree on the exact literal.
-IMAGE_PLACEHOLDER = "[[IMAGEN]]"
+
+_MARKDOWN_IMAGE_PATTERN = re.compile(r"!\[([^\]]*)\]\((https?://[^\s)]+)\)")
+_MARKDOWN_LINK_PATTERN = re.compile(r"(?<!!)\[([^\]]*)\]\((https?://[^\s)]+)\)")
+_MARKDOWN_EMPHASIS_PATTERN = re.compile(r"\*\*([^*]+)\*\*|\*([^*]+)\*|__([^_]+)__|_([^_]+)_")
 
 
-def _build_reply_bodies(
-    *, generated_reply: str, original: FetchedEmail, inline_image_cid: str | None = None
-) -> tuple[str, str]:
+def _strip_markdown_for_plain_text(text: str) -> str:
+    """Best-effort plain-text degradation of the model's Markdown (the real
+    rendering happens in the HTML part — see `_build_reply_bodies`): bold/
+    italic markers removed, links/images collapsed to "label (url)", so a
+    plain-text-only mail client shows readable text instead of literal
+    "**"/"![...]()" syntax."""
+    text = _MARKDOWN_IMAGE_PATTERN.sub(lambda m: f"{m.group(1) or 'Imagen'}: {m.group(2)}", text)
+    text = _MARKDOWN_LINK_PATTERN.sub(lambda m: f"{m.group(1)} ({m.group(2)})", text)
+    text = _MARKDOWN_EMPHASIS_PATTERN.sub(lambda m: next(g for g in m.groups() if g is not None), text)
+    return text
+
+
+def _build_reply_bodies(*, generated_reply: str, original: FetchedEmail) -> tuple[str, str]:
     """Returns (plain_text_body, html_body) with the original email quoted
     underneath the generated reply — matching the standard "On <date>, <sender>
     wrote:" + quoted-body convention every mail client (including Nominalia's
     webmail) uses when you hit Reply, so the draft looks the same either way.
 
-    `inline_image_cid` (bare, no angle brackets) places an <img> referencing
-    that Content-ID at the position marked by `IMAGE_PLACEHOLDER` in
-    `generated_reply`, if present — the caller is responsible for actually
-    attaching the corresponding part via `add_related`. Falls back to placing
-    it right after all the reply text if the model didn't include the
-    marker, so a missing marker never breaks image placement entirely."""
+    The model (prompted with `web_search`/`code_interpreter`) often writes
+    real Markdown — **bold**, bullet lists, and occasionally an inline
+    `![alt](url)` image link it found on the company's own website. The
+    HTML part renders that for real (`nl2br` keeps single newlines as line
+    breaks, matching the plain-text layout); the plain-text part degrades it
+    to readable text instead of showing literal Markdown syntax.
+    """
     attribution = f"El {original.received_at.strftime('%Y-%m-%d %H:%M')}, {original.sender} escribió:"
+    clean_reply = generated_reply.strip()
 
-    has_marker = IMAGE_PLACEHOLDER in generated_reply
-    if has_marker:
-        before, _, after = generated_reply.partition(IMAGE_PLACEHOLDER)
-        before, after = before.strip(), after.strip()
-        clean_reply = "\n\n".join(part for part in (before, after) if part)
-    else:
-        before, after = generated_reply.strip(), ""
-        clean_reply = before
-
+    plain_reply = _strip_markdown_for_plain_text(clean_reply)
     quoted_text = "\n".join(f"> {line}" for line in (original.body_text or "").splitlines())
-    plain_body = f"{clean_reply}\n\n{attribution}\n\n{quoted_text or '> ' + _NO_TEXT_BODY_PLACEHOLDER}"
-
-    def _to_html_paragraph(text: str) -> str:
-        return f"<p>{html_lib.escape(text).replace(chr(10), '<br>')}</p>" if text else ""
-
-    image_html = f'<p><img src="cid:{inline_image_cid}"></p>' if inline_image_cid else ""
-    if inline_image_cid and has_marker:
-        reply_section_html = f"{_to_html_paragraph(before)}{image_html}{_to_html_paragraph(after)}"
-    elif inline_image_cid:
-        reply_section_html = f"{_to_html_paragraph(clean_reply)}{image_html}"
-    else:
-        reply_section_html = _to_html_paragraph(clean_reply)
+    plain_body = f"{plain_reply}\n\n{attribution}\n\n{quoted_text or '> ' + _NO_TEXT_BODY_PLACEHOLDER}"
 
     if original.body_html:
         quoted_html = original.body_html
@@ -167,9 +146,8 @@ def _build_reply_bodies(
         quoted_html = html_lib.escape(original.body_text).replace("\n", "<br>")
     else:
         quoted_html = html_lib.escape(_NO_TEXT_BODY_PLACEHOLDER)
-    html_body = (
-        f"{reply_section_html}<p>{html_lib.escape(attribution)}</p><blockquote>{quoted_html}</blockquote>"
-    )
+    reply_html = markdown_lib.markdown(clean_reply, extensions=["nl2br"])
+    html_body = f"{reply_html}<p>{html_lib.escape(attribution)}</p><blockquote>{quoted_html}</blockquote>"
 
     return plain_body, html_body
 
@@ -311,9 +289,7 @@ class ImapEmailProvider(EmailProvider):
             raw_headers=dict(parsed.items()),
         )
 
-    def create_draft(
-        self, *, subject: str, body: str, in_reply_to: FetchedEmail, inline_image: InlineImage | None = None
-    ) -> DraftCreationResult:
+    def create_draft(self, *, subject: str, body: str, in_reply_to: FetchedEmail) -> DraftCreationResult:
         """Append an RFC822 draft message into the mailbox's drafts folder.
 
         NOTE: Real-world support for this varies by IMAP server. Some servers
@@ -335,28 +311,9 @@ class ImapEmailProvider(EmailProvider):
             message["In-Reply-To"] = in_reply_to.external_message_id
             message["References"] = references
 
-            # A bare (no angle brackets) id for the HTML `cid:` reference; the
-            # actual `Content-ID` header add_related() sets below needs the
-            # angle brackets per RFC 2392 — mixing these two up is the most
-            # common bug with inline images, so keep the distinction explicit.
-            image_cid = make_msgid(domain=domain)[1:-1] if inline_image else None
-            plain_body, html_body = _build_reply_bodies(
-                generated_reply=body, original=in_reply_to, inline_image_cid=image_cid
-            )
+            plain_body, html_body = _build_reply_bodies(generated_reply=body, original=in_reply_to)
             message.set_content(plain_body)
             message.add_alternative(html_body, subtype="html")
-
-            if inline_image is not None:
-                html_part = message.get_payload()[-1]
-                maintype, _, subtype = inline_image.content_type.partition("/")
-                html_part.add_related(
-                    inline_image.content,
-                    maintype=maintype or "image",
-                    subtype=subtype or "octet-stream",
-                    cid=f"<{image_cid}>",
-                    filename=inline_image.filename,
-                    disposition="inline",
-                )
 
             def _append() -> str:
                 conn = self._connect()

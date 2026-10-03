@@ -1,8 +1,8 @@
-"""add agent images
+"""drop agent_images table
 
-Revision ID: 285f3878a408
-Revises: 16d3bb04e654
-Create Date: 2026-09-18 00:00:00.000000
+Revision ID: d2e9a7c13f08
+Revises: c7a1029be456
+Create Date: 2026-10-03 00:00:03.000000
 
 """
 
@@ -12,13 +12,17 @@ from alembic import op
 import sqlalchemy as sa
 
 # revision identifiers, used by Alembic.
-revision: str = "285f3878a408"
-down_revision: Union[str, None] = "16d3bb04e654"
+revision: str = "d2e9a7c13f08"
+down_revision: Union[str, None] = "c7a1029be456"
 branch_labels: Union[str, Sequence[str], None] = None
 depends_on: Union[str, Sequence[str], None] = None
 
 
 def upgrade() -> None:
+    op.drop_table("agent_images")
+
+
+def downgrade() -> None:
     op.create_table(
         "agent_images",
         sa.Column("id", sa.Integer(), nullable=False),
@@ -33,7 +37,3 @@ def upgrade() -> None:
         sa.PrimaryKeyConstraint("id"),
         sa.UniqueConstraint("name", name="uq_agent_images_name"),
     )
-
-
-def downgrade() -> None:
-    op.drop_table("agent_images")

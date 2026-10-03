@@ -37,9 +37,15 @@ class Settings(BaseSettings):
     # LLM
     llm_provider: str = "openai"
     openai_api_key: str = ""
-    openai_model: str = "gpt-5.4-mini"
-    llm_temperature: float = 0
-    llm_max_tokens: int = 1000
+    openai_model: str = "gpt-5.6-sol"
+    # gpt-5.6-sol is a reasoning-tier model: `max_output_tokens` is shared
+    # between its internal reasoning and the final visible message, and
+    # real draft prompts (full Manual Maestro-style instructions +
+    # code_interpreter reading a real file) measured ~2.5-3k reasoning
+    # tokens alone — 1000 silently produced an empty, "incomplete" response
+    # with no error. 8000 leaves real headroom; it's a ceiling, not a
+    # consumption target, so it doesn't by itself raise cost.
+    llm_max_tokens: int = 8000
 
     # Langfuse
     langfuse_enabled: bool = False
@@ -52,18 +58,16 @@ class Settings(BaseSettings):
     max_emails_per_run: int = 20
     max_retry_attempts: int = 3
 
-    # Documents
+    # Documents / knowledge files — real files uploaded to OpenAI's Files API
+    # and attached to generation calls via the code_interpreter tool (see
+    # llm_service.py / processing_service.py), not text-extracted locally.
     documents_storage_path: str = "/app/storage/documents"
-    max_knowledge_context_chars: int = 600000
+    max_upload_file_bytes: int = 512 * 1024 * 1024  # OpenAI Files API hard cap
+    max_knowledge_files_per_call: int = 20
+    max_knowledge_file_total_bytes: int = 200 * 1024 * 1024
 
-    # Agent images (inline images the agent can attach, e.g. a price table)
-    # — a kill switch so the feature can be disabled instantly via env var
-    # if the structured-output draft generation misbehaves in production,
-    # without a code revert/redeploy under pressure.
-    enable_agent_image_embedding: bool = True
-
-    # Web sources (website knowledge ingestion)
-    web_source_poll_interval_seconds: int = 86400
+    # Drive sync (one file per DriveSource, polled by content hash)
+    drive_poll_interval_seconds: int = 60
 
     # Initial admin seed
     initial_admin_email: str = "admin@lawall.local"

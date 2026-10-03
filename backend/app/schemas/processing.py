@@ -63,25 +63,25 @@ class SimulateDraftRequest(BaseModel):
     email_body: str = Field(..., min_length=1)
 
 
-class SourceCitation(BaseModel):
-    """One (source, verbatim excerpt) pair confirmed to actually appear in the
-    knowledge base sent to the model for this specific simulated question —
-    lets staff see not just which document was consulted, but the exact, real
-    passage behind the answer, so they know precisely what to edit if a
-    response needs adjusting. Unverifiable self-reported citations are
-    dropped before reaching this schema, so every entry here is trustworthy."""
+class SimulatedImage(BaseModel):
+    """An image the model's code_interpreter produced or displayed during
+    this simulated generation — a chart it rendered, or an existing
+    uploaded image it chose to show as-is. Base64-encoded inline since the
+    Simulador never persists anything (no storage/endpoint needed)."""
 
-    source: str
-    excerpt: str
+    filename: str
+    content_type: str
+    data_base64: str
 
 
 class SimulateDraftResponse(BaseModel):
     generated_body: str
     llm_provider: str
     llm_model: str
-    sources_used: list[SourceCitation]
-    # The agent image (if any) that would be embedded inline in a real reply
-    # to this email — lets the Simulador preview exactly what a customer
-    # would see, not just the draft text.
-    attached_image_id: int | None = None
-    attached_image_name: str | None = None
+    # Names of the files/web searches the model actually consulted while
+    # generating this draft — derived from the Responses API's own tool-call
+    # trace (which code_interpreter files it opened, which web searches it
+    # ran), not self-reported by the model. See processing_service.py's
+    # `_derive_sources_used`.
+    sources_used: list[str]
+    generated_images: list[SimulatedImage] = []

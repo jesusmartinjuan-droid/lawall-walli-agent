@@ -8,8 +8,8 @@ BEAT_SCHEDULE = {
         "task": "app.workers.tasks.poll_active_mailboxes",
         "schedule": float(settings.mail_poll_interval_seconds),
     },
-    "refresh-active-web-sources": {
-        "task": "app.workers.tasks.refresh_active_web_sources",
-        "schedule": float(settings.web_source_poll_interval_seconds),
+    "sync-active-drive-sources": {
+        "task": "app.workers.tasks.sync_active_drive_sources",
+        "schedule": float(settings.drive_poll_interval_seconds),
     },
 }

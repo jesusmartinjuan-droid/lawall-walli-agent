@@ -40,8 +40,7 @@ class ProcessingLogStatus(enum.StrEnum):
 class ProcessingStep(enum.StrEnum):
     FETCH_EMAIL = "fetch_email"
     LOAD_PROMPT = "load_prompt"
-    LOAD_DOCUMENTS = "load_documents"
-    BUILD_CONTEXT = "build_context"
+    ATTACH_FILES = "attach_files"
     CALL_LLM = "call_llm"
     CREATE_DRAFT = "create_draft"
     FINALIZE = "finalize"

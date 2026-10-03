@@ -1,27 +1,22 @@
-import io
 from datetime import UTC, datetime
 
-from PIL import Image
-
 from app.core.encryption import encrypt_value
+from app.models.document import Document
+from app.models.drive_source import DriveSource
 from app.models.email_message import EmailMessage
 from app.models.enums import DraftStatus, MailboxProvider, ProcessingStatus
 from app.models.mailbox import Mailbox
-from app.services.agent_image_service import AgentImageService
 from app.services.email_provider_service import DraftCreationResult
-from app.services.processing_service import ProcessingService, render_prompt_template
-
-
-def _png_bytes() -> bytes:
-    buffer = io.BytesIO()
-    Image.new("RGB", (10, 10), color=(200, 50, 50)).save(buffer, format="PNG")
-    return buffer.getvalue()
-
-
-def _create_agent_image(db_session, *, name: str, description: str):
-    return AgentImageService(db_session).create(
-        name=name, description=description, original_filename="tabla.png", file_bytes=_png_bytes()
-    )
+from app.services.llm_service import LLMResponse
+from app.services.processing_service import (
+    AttachedFile,
+    KnowledgeFileLimitExceededError,
+    ProcessingService,
+    _collect_attached_files,
+    _derive_sources_used,
+    _enforce_file_caps,
+    render_prompt_template,
+)
 
 
 def _create_mailbox(db_session) -> Mailbox:
@@ -60,6 +55,40 @@ def _create_email(db_session, mailbox: Mailbox) -> EmailMessage:
     return message
 
 
+def _create_document(
+    db_session, *, filename: str, openai_file_id: str | None, size_bytes: int = 100
+) -> Document:
+    document = Document(
+        filename=f"stored-{filename}",
+        original_filename=filename,
+        content_type="application/octet-stream",
+        storage_path=f"/tmp/{filename}",
+        size_bytes=size_bytes,
+        openai_file_id=openai_file_id,
+        is_active=True,
+    )
+    db_session.add(document)
+    db_session.commit()
+    db_session.refresh(document)
+    return document
+
+
+def _create_drive_source(
+    db_session, *, name: str, openai_file_id: str | None, size_bytes: int = 100
+) -> DriveSource:
+    drive_source = DriveSource(
+        name=name,
+        drive_url="https://drive.google.com/file/d/abc/view",
+        openai_file_id=openai_file_id,
+        size_bytes=size_bytes,
+        is_active=True,
+    )
+    db_session.add(drive_source)
+    db_session.commit()
+    db_session.refresh(drive_source)
+    return drive_source
+
+
 def test_render_prompt_template_substitutes_placeholders_when_present():
     template = "Docs: {{company_documents_context}}\nThread: {{email_thread_context}}"
     rendered = render_prompt_template(
@@ -70,9 +99,10 @@ def test_render_prompt_template_substitutes_placeholders_when_present():
 
 def test_render_prompt_template_appends_missing_placeholders_instead_of_dropping_them():
     """A prompt pasted from scratch (no {{...}} tokens at all) must still
-    receive the knowledge base and thread history — this is the exact bug
-    that left the agent blind to company knowledge for days when a custom
-    prompt replaced the default one without knowing placeholders existed."""
+    receive the "files are attached" note and thread history — this is the
+    exact bug that left the agent blind to company knowledge for days when a
+    custom prompt replaced the default one without knowing placeholders
+    existed."""
     template = "Eres Walli. Responde de forma breve y profesional."
 
     rendered = render_prompt_template(
@@ -108,7 +138,7 @@ def test_process_email_generates_draft_with_mock_llm_and_handles_mailbox_failure
 
     def fake_build_email_provider(mailbox_arg, password_arg):
         class _FakeProvider:
-            def create_draft(self, *, subject, body, in_reply_to, inline_image=None):
+            def create_draft(self, *, subject, body, in_reply_to):
                 return DraftCreationResult(success=False, mailbox_draft_id=None, message="Not supported.")
 
         return _FakeProvider()
@@ -181,83 +211,91 @@ def test_simulate_draft_returns_generated_text_without_persisting_anything(db_se
     assert db_session.scalar(select(func.count()).select_from(ProcessingLog)) == 0
 
 
-def test_build_agent_image_selection_lists_available_images():
-    from app.services.processing_service import _build_agent_image_selection
+def test_collect_attached_files_skips_documents_missing_an_openai_file_id(db_session):
+    _create_document(db_session, filename="ready.docx", openai_file_id="file-1")
+    _create_document(db_session, filename="pending.docx", openai_file_id=None)
+    _create_drive_source(db_session, name="Drive OK", openai_file_id="file-2")
+    _create_drive_source(db_session, name="Drive pending", openai_file_id=None)
 
-    class _FakeImage:
-        def __init__(self, name, description):
-            self.name = name
-            self.description = description
+    from app.services.document_service import DocumentService
+    from app.services.drive_source_service import DriveSourceService
 
-    images = [_FakeImage("Tabla ES", "Usar en español."), _FakeImage("Tabla EN", "Use in English.")]
-    schema_property, note = _build_agent_image_selection(images)
+    documents = DocumentService(db_session).list_active_documents()
+    drive_sources = DriveSourceService(db_session).list_active_drive_sources()
 
-    assert schema_property["enum"] == ["Tabla ES", "Tabla EN", "ninguna"]
-    assert "Tabla ES: Usar en español." in note
-    assert "Tabla EN: Use in English." in note
+    attached = _collect_attached_files(documents, drive_sources)
 
-
-def test_build_agent_image_selection_with_no_images_only_offers_none():
-    from app.services.processing_service import _build_agent_image_selection
-
-    schema_property, note = _build_agent_image_selection([])
-
-    assert schema_property["enum"] == ["ninguna"]
-    assert note == ""
+    assert {a.name for a in attached} == {"ready.docx", "Drive OK"}
 
 
-def test_parse_draft_with_image_extracts_the_chosen_image():
-    import json
+def test_enforce_file_caps_raises_when_count_exceeds_limit(monkeypatch):
+    from app.core.config import settings
 
-    from app.services.processing_service import _parse_draft_with_image
+    monkeypatch.setattr(settings, "max_knowledge_files_per_call", 1)
+    attached = [
+        AttachedFile(name="a.docx", openai_file_id="f1"),
+        AttachedFile(name="b.docx", openai_file_id="f2"),
+    ]
+    documents = [
+        Document(
+            original_filename="a.docx", size_bytes=10, filename="a", content_type="x", storage_path="/x"
+        ),
+        Document(
+            original_filename="b.docx", size_bytes=10, filename="b", content_type="x", storage_path="/x"
+        ),
+    ]
 
-    raw = json.dumps({"draft": "Hola,\n\nAquí tienes la tabla.", "image_name": "Tabla ES"})
-    draft, image_name = _parse_draft_with_image(raw)
-
-    assert draft == "Hola,\n\nAquí tienes la tabla."
-    assert image_name == "Tabla ES"
-
-
-def test_parse_draft_with_image_treats_ninguna_as_no_image():
-    import json
-
-    from app.services.processing_service import _parse_draft_with_image
-
-    raw = json.dumps({"draft": "Hola.", "image_name": "ninguna"})
-    draft, image_name = _parse_draft_with_image(raw)
-
-    assert draft == "Hola."
-    assert image_name is None
-
-
-def test_parse_draft_with_image_falls_back_to_raw_text_on_invalid_json():
-    from app.services.processing_service import _parse_draft_with_image
-
-    draft, image_name = _parse_draft_with_image("Esto no es JSON.")
-
-    assert draft == "Esto no es JSON."
-    assert image_name is None
+    try:
+        _enforce_file_caps(attached, documents, [])
+        raise AssertionError("expected KnowledgeFileLimitExceededError")
+    except KnowledgeFileLimitExceededError as exc:
+        assert "máximo permitido" in str(exc)
 
 
-def test_generate_and_store_draft_attaches_the_image_the_model_chooses(db_session, monkeypatch):
-    import json
+def test_enforce_file_caps_raises_when_total_bytes_exceeds_limit(monkeypatch):
+    from app.core.config import settings
 
-    from app.services.llm_service import LLMResponse
+    monkeypatch.setattr(settings, "max_knowledge_file_total_bytes", 100)
+    attached = [AttachedFile(name="a.docx", openai_file_id="f1")]
+    documents = [
+        Document(
+            original_filename="a.docx", size_bytes=1000, filename="a", content_type="x", storage_path="/x"
+        )
+    ]
 
+    try:
+        _enforce_file_caps(attached, documents, [])
+        raise AssertionError("expected KnowledgeFileLimitExceededError")
+    except KnowledgeFileLimitExceededError as exc:
+        assert "tamaño total" in str(exc)
+
+
+def test_derive_sources_used_finds_referenced_filename_and_web_searches():
+    attached = [
+        AttachedFile(name="tabla.xlsx", openai_file_id="f1"),
+        AttachedFile(name="manual.docx", openai_file_id="f2"),
+    ]
+    code_snippets = ["import pandas as pd\npd.read_excel('tabla.xlsx')"]
+    web_search_queries = ["la-wall.com plazos de entrega"]
+
+    sources = _derive_sources_used(attached, code_snippets, web_search_queries)
+
+    assert sources == ["tabla.xlsx", "Búsqueda web: la-wall.com plazos de entrega"]
+
+
+def test_generate_and_store_draft_attaches_active_file_ids_to_the_llm_call(db_session, monkeypatch):
+    document = _create_document(db_session, filename="manual.docx", openai_file_id="file-abc")
+    drive_source = _create_drive_source(db_session, name="Tabla Drive", openai_file_id="file-xyz")
     mailbox = _create_mailbox(db_session)
     message = _create_email(db_session, mailbox)
-    image = _create_agent_image(
-        db_session, name="Tabla ES", description="Usar cuando pregunten por precios en español."
-    )
 
     service = ProcessingService(db_session)
     captured_kwargs = {}
 
     def _fake_generate_draft(**kwargs):
         captured_kwargs.update(kwargs)
-        content = json.dumps({"draft": "Aquí tienes la tabla de precios.", "image_name": "Tabla ES"})
         return LLMResponse(
-            content=content,
+            content="Aquí tienes la respuesta.",
             provider="mock",
             model="mock-1",
             input_tokens=10,
@@ -269,9 +307,7 @@ def test_generate_and_store_draft_attaches_the_image_the_model_chooses(db_sessio
 
     def fake_build_email_provider(mailbox_arg, password_arg):
         class _FakeProvider:
-            def create_draft(self, *, subject, body, in_reply_to, inline_image=None):
-                assert inline_image is not None
-                assert inline_image.content_type == "image/png"
+            def create_draft(self, *, subject, body, in_reply_to):
                 return DraftCreationResult(success=True, mailbox_draft_id="1", message="ok")
 
         return _FakeProvider()
@@ -280,95 +316,47 @@ def test_generate_and_store_draft_attaches_the_image_the_model_chooses(db_sessio
 
     service.process_email(message.id)
 
+    assert set(captured_kwargs["file_ids"]) == {document.openai_file_id, drive_source.openai_file_id}
     draft = service.drafts.get_by_email_message_id(message.id)
-    assert draft.agent_image_id == image.id
-    assert draft.generated_body == "Aquí tienes la tabla de precios."
-    assert captured_kwargs["response_schema"] is not None
+    assert draft.generated_body == "Aquí tienes la respuesta."
     assert draft.status == DraftStatus.CREATED_IN_MAILBOX
 
 
-def test_generate_and_store_draft_sets_no_image_when_model_chooses_ninguna(db_session, monkeypatch):
-    import json
+def test_generate_and_store_draft_fails_loudly_when_file_cap_exceeded(db_session, monkeypatch):
+    from app.core.config import settings
+    from app.models.enums import ProcessingLogStatus, ProcessingStep
 
-    from app.services.llm_service import LLMResponse
-
+    monkeypatch.setattr(settings, "max_knowledge_files_per_call", 1)
+    _create_document(db_session, filename="a.docx", openai_file_id="file-1")
+    _create_document(db_session, filename="b.docx", openai_file_id="file-2")
     mailbox = _create_mailbox(db_session)
     message = _create_email(db_session, mailbox)
-    _create_agent_image(db_session, name="Tabla ES", description="Usar en español.")
 
     service = ProcessingService(db_session)
-
-    def _fake_generate_draft(**kwargs):
-        content = json.dumps({"draft": "Gracias por tu consulta.", "image_name": "ninguna"})
-        return LLMResponse(
-            content=content,
-            provider="mock",
-            model="mock-1",
-            input_tokens=10,
-            output_tokens=10,
-            latency_ms=1,
-        )
-
-    monkeypatch.setattr(service.llm_service, "generate_draft", _fake_generate_draft)
-
-    def fake_build_email_provider(mailbox_arg, password_arg):
-        class _FakeProvider:
-            def create_draft(self, *, subject, body, in_reply_to, inline_image=None):
-                assert inline_image is None
-                return DraftCreationResult(success=True, mailbox_draft_id="1", message="ok")
-
-        return _FakeProvider()
-
-    monkeypatch.setattr("app.services.processing_service.build_email_provider", fake_build_email_provider)
-
     service.process_email(message.id)
 
-    draft = service.drafts.get_by_email_message_id(message.id)
-    assert draft.agent_image_id is None
+    assert service.drafts.get_by_email_message_id(message.id) is None
+    logs = service.logs.list_for_email(message.id)
+    attach_files_log = next(log for log in logs if log.step == ProcessingStep.ATTACH_FILES)
+    assert attach_files_log.status == ProcessingLogStatus.FAILED
+    assert "máximo permitido" in attach_files_log.error_message
 
 
-def test_load_inline_image_degrades_gracefully_when_image_was_deleted(db_session):
-    from app.models.draft import Draft
+def test_simulate_draft_returns_sources_used_from_the_models_tool_calls(db_session, monkeypatch):
+    document = _create_document(db_session, filename="tabla.xlsx", openai_file_id="file-abc")
 
-    mailbox = _create_mailbox(db_session)
-    message = _create_email(db_session, mailbox)
-    image = _create_agent_image(db_session, name="Tabla ES", description="...")
-
-    service = ProcessingService(db_session)
-    draft = Draft(
-        mailbox_id=mailbox.id,
-        email_message_id=message.id,
-        agent_image_id=image.id,
-        generated_body="Hola",
-        llm_provider="mock",
-        llm_model="mock-1",
-        status=DraftStatus.GENERATED,
-    )
-    service.drafts.add(draft)
-    service.drafts.commit()
-
-    service.agent_image_service.delete(image.id)
-
-    assert service._load_inline_image(draft) is None
-
-
-def test_simulate_draft_returns_the_attached_image_the_model_chooses(db_session, monkeypatch):
-    import json
-
-    from app.services.llm_service import LLMResponse
-
-    image = _create_agent_image(db_session, name="Tabla ES", description="Usar en español.")
     service = ProcessingService(db_session)
 
     def _fake_generate_draft(**kwargs):
-        content = json.dumps({"draft": "Aquí tienes la tabla.", "image_name": "Tabla ES"})
         return LLMResponse(
-            content=content,
+            content="Aquí tienes la tabla.",
             provider="mock",
             model="mock-1",
             input_tokens=10,
             output_tokens=10,
             latency_ms=1,
+            code_interpreter_snippets=[f"pd.read_excel('{document.original_filename}')"],
+            web_search_queries=[],
         )
 
     monkeypatch.setattr(service.llm_service, "generate_draft", _fake_generate_draft)
@@ -376,197 +364,19 @@ def test_simulate_draft_returns_the_attached_image_the_model_chooses(db_session,
     result = service.simulate_draft("¿Qué precio tiene?")
 
     assert result.generated_body == "Aquí tienes la tabla."
-    assert result.attached_image_id == image.id
-    assert result.attached_image_name == "Tabla ES"
+    assert result.sources_used == ["tabla.xlsx"]
 
 
-def test_generate_and_store_draft_skips_image_selection_when_disabled(db_session, monkeypatch):
+def test_simulate_draft_fails_loudly_when_file_cap_exceeded(db_session, monkeypatch):
     from app.core.config import settings
 
-    mailbox = _create_mailbox(db_session)
-    message = _create_email(db_session, mailbox)
-    _create_agent_image(db_session, name="Tabla ES", description="...")
-    monkeypatch.setattr(settings, "enable_agent_image_embedding", False)
+    monkeypatch.setattr(settings, "max_knowledge_files_per_call", 0)
+    _create_document(db_session, filename="a.docx", openai_file_id="file-1")
 
     service = ProcessingService(db_session)
-    captured_kwargs = {}
-    original_generate_draft = service.llm_service.generate_draft
 
-    def _spy_generate_draft(**kwargs):
-        captured_kwargs.update(kwargs)
-        return original_generate_draft(**kwargs)
-
-    monkeypatch.setattr(service.llm_service, "generate_draft", _spy_generate_draft)
-
-    def fake_build_email_provider(mailbox_arg, password_arg):
-        class _FakeProvider:
-            def create_draft(self, *, subject, body, in_reply_to, inline_image=None):
-                assert inline_image is None
-                return DraftCreationResult(success=True, mailbox_draft_id="1", message="ok")
-
-        return _FakeProvider()
-
-    monkeypatch.setattr("app.services.processing_service.build_email_provider", fake_build_email_provider)
-
-    service.process_email(message.id)
-
-    assert captured_kwargs["response_schema"] is None
-    draft = service.drafts.get_by_email_message_id(message.id)
-    assert draft.agent_image_id is None
-
-
-def test_parse_simulator_output_extracts_draft_image_and_citations():
-    import json
-
-    from app.services.processing_service import _parse_simulator_output
-
-    raw = json.dumps(
-        {
-            "draft": "Hola, aquí tienes tu respuesta.",
-            "image_name": "ninguna",
-            "citations": [
-                {
-                    "source": "### Manual Maestro",
-                    "excerpt": "250 metros se interpretan como metros cuadrados.",
-                },
-                {"source": "Condiciones Generales", "excerpt": "El molde sigue siendo propiedad de laWALL."},
-            ],
-        }
-    )
-    body, image_name, citations = _parse_simulator_output(raw)
-
-    assert body == "Hola, aquí tienes tu respuesta."
-    assert image_name is None
-    assert [(c.source, c.excerpt) for c in citations] == [
-        ("Manual Maestro", "250 metros se interpretan como metros cuadrados."),
-        ("Condiciones Generales", "El molde sigue siendo propiedad de laWALL."),
-    ]
-
-
-def test_parse_simulator_output_extracts_the_chosen_image():
-    import json
-
-    from app.services.processing_service import _parse_simulator_output
-
-    raw = json.dumps({"draft": "Aquí tienes la tabla.", "image_name": "Tabla ES", "citations": []})
-    body, image_name, citations = _parse_simulator_output(raw)
-
-    assert body == "Aquí tienes la tabla."
-    assert image_name == "Tabla ES"
-    assert citations == []
-
-
-def test_parse_simulator_output_falls_back_to_raw_text_on_invalid_json():
-    from app.services.processing_service import _parse_simulator_output
-
-    body, image_name, citations = _parse_simulator_output("Esto no es JSON en absoluto.")
-
-    assert body == "Esto no es JSON en absoluto."
-    assert image_name is None
-    assert citations == []
-
-
-def test_parse_simulator_output_ignores_incomplete_citation_entries():
-    import json
-
-    from app.services.processing_service import _parse_simulator_output
-
-    raw = json.dumps(
-        {
-            "draft": "Hola.",
-            "image_name": "ninguna",
-            "citations": [{"source": "Manual Maestro"}, {"excerpt": "sin fuente"}, {}],
-        }
-    )
-    body, image_name, citations = _parse_simulator_output(raw)
-
-    assert body == "Hola."
-    assert citations == []
-
-
-def test_filter_verified_citations_drops_excerpts_not_present_in_the_context():
-    from app.schemas.processing import SourceCitation
-    from app.services.processing_service import _filter_verified_citations
-
-    context = "### Manual Maestro\n250 metros se interpretan como metros cuadrados.\n"
-    citations = [
-        SourceCitation(source="Manual Maestro", excerpt="250 metros se interpretan como metros cuadrados."),
-        SourceCitation(source="Manual Maestro", excerpt="Esto no aparece en ningún sitio."),
-    ]
-
-    kept = _filter_verified_citations(citations, context)
-
-    assert [(c.source, c.excerpt) for c in kept] == [
-        ("Manual Maestro", "250 metros se interpretan como metros cuadrados.")
-    ]
-
-
-def test_filter_verified_citations_tolerates_minor_rewording_by_the_model():
-    from app.schemas.processing import SourceCitation
-    from app.services.processing_service import _filter_verified_citations
-
-    context = "El molde fabricado por encargo del cliente sigue siendo propiedad de laWALL."
-    citations = [
-        SourceCitation(
-            source="Condiciones",
-            # Model added "es y" while quoting — a single small rewording,
-            # not a fabrication.
-            excerpt="El molde fabricado por encargo del cliente es y sigue siendo propiedad de laWALL.",
-        ),
-    ]
-
-    kept = _filter_verified_citations(citations, context)
-
-    assert len(kept) == 1
-
-
-def test_filter_verified_citations_still_drops_mostly_invented_excerpts():
-    from app.schemas.processing import SourceCitation
-    from app.services.processing_service import _filter_verified_citations
-
-    context = "El molde fabricado por encargo del cliente sigue siendo propiedad de laWALL."
-    citations = [
-        SourceCitation(
-            source="Condiciones",
-            excerpt="laWALL garantiza la exclusividad del diseño durante cinco años tras la entrega.",
-        ),
-    ]
-
-    kept = _filter_verified_citations(citations, context)
-
-    assert kept == []
-
-
-def test_simulate_draft_drops_citations_that_cannot_be_verified(db_session):
-    import json
-
-    from app.services.llm_service import LLMResponse
-
-    service = ProcessingService(db_session)
-    canned = json.dumps(
-        {
-            "draft": "Hola,\n\nGracias por tu consulta.",
-            "image_name": "ninguna",
-            "citations": [
-                {"source": "Manual Maestro", "excerpt": "esto no está en la base de conocimiento activa"}
-            ],
-        }
-    )
-    captured_kwargs = {}
-
-    def _fake_generate_draft(**kwargs):
-        captured_kwargs.update(kwargs)
-        return LLMResponse(
-            content=canned, provider="mock", model="mock-1", input_tokens=10, output_tokens=10, latency_ms=1
-        )
-
-    service.llm_service.generate_draft = _fake_generate_draft
-
-    result = service.simulate_draft("¿Qué tamaño tienen las planchas?")
-
-    assert captured_kwargs["response_schema"] is not None
-    assert result.generated_body == "Hola,\n\nGracias por tu consulta."
-    # No active documents/sources are loaded in this test's DB, so the
-    # self-reported excerpt can never verify against an (empty) knowledge
-    # context and must be dropped rather than shown as unreliable.
-    assert result.sources_used == []
+    try:
+        service.simulate_draft("¿Qué precio tiene?")
+        raise AssertionError("expected KnowledgeFileLimitExceededError")
+    except KnowledgeFileLimitExceededError:
+        pass

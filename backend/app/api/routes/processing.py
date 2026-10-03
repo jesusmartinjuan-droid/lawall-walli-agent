@@ -10,7 +10,7 @@ from app.schemas.processing import (
     SimulateDraftResponse,
 )
 from app.services.llm_service import LLMProviderError
-from app.services.processing_service import ProcessingService
+from app.services.processing_service import KnowledgeFileLimitExceededError, ProcessingService
 
 router = APIRouter(prefix="/api/processing", tags=["processing"])
 
@@ -21,6 +21,8 @@ def simulate_draft(
 ):
     try:
         return ProcessingService(db).simulate_draft(payload.email_body)
+    except KnowledgeFileLimitExceededError as exc:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(exc)) from exc
     except LLMProviderError as exc:
         raise HTTPException(
             status_code=status.HTTP_502_BAD_GATEWAY,

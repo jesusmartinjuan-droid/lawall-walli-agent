@@ -3,25 +3,14 @@ real network access by faking the `imaplib.IMAP4_SSL` connection and
 inspecting the exact bytes it would have APPENDed to the mailbox."""
 
 import email as email_lib
-import io
 from datetime import UTC, datetime
 
-from PIL import Image
-
 from app.services.email_provider_service import (
-    IMAGE_PLACEHOLDER,
     FetchedEmail,
     ImapCredentials,
     ImapEmailProvider,
-    InlineImage,
     _extract_bodies,
 )
-
-
-def _png_bytes() -> bytes:
-    buffer = io.BytesIO()
-    Image.new("RGB", (4, 4), color=(255, 0, 0)).save(buffer, format="PNG")
-    return buffer.getvalue()
 
 
 class _FakeImapConnection:
@@ -200,6 +189,36 @@ def test_create_draft_quotes_original_email_in_plain_text_and_html(monkeypatch):
     assert "<p>Hola,</p><p>¿cuál es el precio?</p>" in body_html
 
 
+def test_create_draft_renders_markdown_in_html_and_degrades_it_in_plain_text(monkeypatch):
+    """The model (prompted with web_search/code_interpreter) writes real
+    Markdown — bold text and occasionally an inline image link it found on
+    the company's own site. The HTML part must render that for real; the
+    plain-text part must never show literal "**"/"![...]()" syntax."""
+    fake_connection = _FakeImapConnection()
+    provider = _make_provider(monkeypatch, fake_connection)
+
+    body = (
+        "Hola,\n\n**La tarifa general** depende del pedido.\n\n"
+        "![Tarifa general de precios](https://la-wall.com/wp-content/uploads/precios.jpg)\n\n"
+        "Gracias.\nUn saludo"
+    )
+    provider.create_draft(subject="Consulta", body=body, in_reply_to=_fetched_email())
+
+    parsed = email_lib.message_from_bytes(fake_connection.appended_message)
+    body_text, body_html = _extract_bodies(parsed)
+
+    assert "<strong>La tarifa general</strong>" in body_html
+    assert "<img " in body_html
+    assert 'src="https://la-wall.com/wp-content/uploads/precios.jpg"' in body_html
+    assert "Gracias.<br" in body_html  # single newlines still become line breaks (nl2br)
+
+    assert "**" not in body_text
+    assert "![" not in body_text
+    assert "La tarifa general" in body_text
+    assert "Tarifa general de precios: https://la-wall.com/wp-content/uploads/precios.jpg" in body_text
+    assert "Gracias.\nUn saludo" in body_text
+
+
 def test_create_draft_uses_placeholder_when_original_has_no_text_body(monkeypatch):
     fake_connection = _FakeImapConnection()
     provider = _make_provider(monkeypatch, fake_connection)
@@ -212,117 +231,6 @@ def test_create_draft_uses_placeholder_when_original_has_no_text_body(monkeypatc
 
     assert "Correo original sin contenido de texto" in body_text
     assert "Correo original sin contenido de texto" in body_html
-
-
-def test_create_draft_with_inline_image_embeds_it_as_cid_not_attachment(monkeypatch):
-    """Mandatory smoke test for the add_related()/cid: mechanics — no prior
-    usage of this exists anywhere in the codebase, so this proves the
-    resulting MIME structure is what a mail client would actually render
-    (an inline image, not a file attachment) before anything downstream is
-    wired to depend on it."""
-    fake_connection = _FakeImapConnection()
-    provider = _make_provider(monkeypatch, fake_connection)
-    image_bytes = _png_bytes()
-    inline_image = InlineImage(content=image_bytes, content_type="image/png", filename="tabla.png")
-
-    result = provider.create_draft(
-        subject="Consulta",
-        body="Aquí tienes la tabla.",
-        in_reply_to=_fetched_email(),
-        inline_image=inline_image,
-    )
-
-    assert result.success
-    parsed = email_lib.message_from_bytes(fake_connection.appended_message)
-    assert parsed.is_multipart()
-
-    image_parts = [part for part in parsed.walk() if part.get_content_type() == "image/png"]
-    assert len(image_parts) == 1
-    image_part = image_parts[0]
-
-    # Embedded inline (Content-ID reference), never as a file attachment.
-    assert "attachment" not in str(image_part.get("Content-Disposition") or "")
-    assert image_part.get_payload(decode=True) == image_bytes
-
-    content_id = image_part.get("Content-ID")
-    assert content_id is not None
-    bare_cid = content_id.strip("<>")
-
-    html_parts = [part for part in parsed.walk() if part.get_content_type() == "text/html"]
-    assert len(html_parts) == 1
-    html_text = html_parts[0].get_payload(decode=True).decode("utf-8")
-    assert f"cid:{bare_cid}" in html_text
-
-    plain_parts = [part for part in parsed.walk() if part.get_content_type() == "text/plain"]
-    assert len(plain_parts) == 1
-    plain_text = plain_parts[0].get_payload(decode=True).decode("utf-8")
-    assert "cid:" not in plain_text
-
-
-def test_create_draft_with_inline_image_places_it_at_the_marker_not_the_end(monkeypatch):
-    """When the draft text contains IMAGE_PLACEHOLDER, the image must render
-    at that exact point — e.g. before a closing sign-off — instead of always
-    landing after all the reply text."""
-    fake_connection = _FakeImapConnection()
-    provider = _make_provider(monkeypatch, fake_connection)
-    inline_image = InlineImage(content=_png_bytes(), content_type="image/png", filename="tabla.png")
-    body = f"Hola,\n\nAquí tienes la tabla.\n\n{IMAGE_PLACEHOLDER}\n\nGracias, un saludo."
-
-    provider.create_draft(
-        subject="Consulta", body=body, in_reply_to=_fetched_email(), inline_image=inline_image
-    )
-
-    parsed = email_lib.message_from_bytes(fake_connection.appended_message)
-
-    html_text = next(
-        part.get_payload(decode=True).decode("utf-8")
-        for part in parsed.walk()
-        if part.get_content_type() == "text/html"
-    )
-    image_position = html_text.index("<img")
-    assert "Aquí tienes la tabla." in html_text[:image_position]
-    assert "Gracias, un saludo." in html_text[image_position:]
-
-    plain_text = next(
-        part.get_payload(decode=True).decode("utf-8")
-        for part in parsed.walk()
-        if part.get_content_type() == "text/plain"
-    )
-    assert IMAGE_PLACEHOLDER not in plain_text
-    assert "Aquí tienes la tabla." in plain_text
-    assert "Gracias, un saludo." in plain_text
-
-
-def test_create_draft_with_inline_image_falls_back_to_the_end_when_model_omits_the_marker(monkeypatch):
-    fake_connection = _FakeImapConnection()
-    provider = _make_provider(monkeypatch, fake_connection)
-    inline_image = InlineImage(content=_png_bytes(), content_type="image/png", filename="tabla.png")
-
-    provider.create_draft(
-        subject="Consulta",
-        body="Aquí tienes la tabla, sin marcador.",
-        in_reply_to=_fetched_email(),
-        inline_image=inline_image,
-    )
-
-    parsed = email_lib.message_from_bytes(fake_connection.appended_message)
-    html_text = next(
-        part.get_payload(decode=True).decode("utf-8")
-        for part in parsed.walk()
-        if part.get_content_type() == "text/html"
-    )
-    assert html_text.index("<img") > html_text.index("Aquí tienes la tabla, sin marcador.")
-
-
-def test_create_draft_without_inline_image_attaches_nothing(monkeypatch):
-    fake_connection = _FakeImapConnection()
-    provider = _make_provider(monkeypatch, fake_connection)
-
-    provider.create_draft(subject="Consulta", body="Respuesta", in_reply_to=_fetched_email())
-
-    parsed = email_lib.message_from_bytes(fake_connection.appended_message)
-    image_parts = [part for part in parsed.walk() if part.get_content_maintype() == "image"]
-    assert image_parts == []
 
 
 def test_get_latest_uid_returns_uidnext_minus_one(monkeypatch):

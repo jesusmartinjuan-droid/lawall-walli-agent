@@ -58,39 +58,31 @@ export interface DocumentItem {
   original_filename: string;
   content_type: string;
   is_active: boolean;
-  text_length: number;
+  size_bytes: number;
+  openai_file_id: string | null;
+  openai_file_uploaded_at: string | null;
+  openai_upload_error: string | null;
   created_at: string;
   updated_at: string;
 }
 
-export interface AgentImage {
+export interface DriveSource {
   id: number;
   name: string;
-  description: string;
-  original_filename: string;
-  content_type: string;
-  created_at: string;
-  updated_at: string;
-}
-
-export interface WebSource {
-  id: number;
-  name: string;
-  root_url: string;
-  max_pages: number;
+  drive_url: string;
   is_active: boolean;
-  pages_crawled: number | null;
-  text_length: number;
-  last_fetched_at: string | null;
-  last_fetch_error: string | null;
+  openai_file_id: string | null;
+  openai_file_uploaded_at: string | null;
+  size_bytes: number | null;
+  last_checked_at: string | null;
+  last_sync_error: string | null;
   created_at: string;
   updated_at: string;
 }
 
-export interface WebSourceFormValues {
+export interface DriveSourceFormValues {
   name: string;
-  root_url: string;
-  max_pages: number;
+  drive_url: string;
 }
 
 export type ProcessingStatus =
@@ -117,8 +109,7 @@ export type ProcessingLogStatus = "pending" | "processing" | "success" | "failed
 export type ProcessingStep =
   | "fetch_email"
   | "load_prompt"
-  | "load_documents"
-  | "build_context"
+  | "attach_files"
   | "call_llm"
   | "create_draft"
   | "finalize";
@@ -155,18 +146,18 @@ export interface ProcessingDetail {
   logs: ProcessingLogItem[];
 }
 
-export interface SourceCitation {
-  source: string;
-  excerpt: string;
+export interface SimulatedImage {
+  filename: string;
+  content_type: string;
+  data_base64: string;
 }
 
 export interface SimulateDraftResponse {
   generated_body: string;
   llm_provider: string;
   llm_model: string;
-  sources_used: SourceCitation[];
-  attached_image_id: number | null;
-  attached_image_name: string | null;
+  sources_used: string[];
+  generated_images: SimulatedImage[];
 }
 
 export type DraftStatus = "generated" | "created_in_mailbox" | "failed_to_create_in_mailbox" | "discarded";

@@ -1,16 +1,17 @@
-from sqlalchemy import Boolean, String, Text
+from datetime import datetime
+
+from sqlalchemy import Boolean, DateTime, Integer, String
 from sqlalchemy.orm import Mapped, mapped_column
 
 from app.db.base import Base, TimestampMixin
 
 
 class Document(Base, TimestampMixin):
-    """A knowledge-base document uploaded by staff.
-
-    Phase 1 stores the fully extracted text and injects it directly into the
-    LLM context (see KnowledgeContextService). Phase 2 can add chunking,
-    embeddings and a vector index without changing this table's core shape.
-    """
+    """A local file staff uploaded for the agent to consult directly via the
+    OpenAI Responses API's code_interpreter tool (see LLMService). Walli no
+    longer extracts text from this file — the real bytes are uploaded as-is
+    to OpenAI's Files API, and `openai_file_id` is what actually gets
+    attached to a generation call."""
 
     __tablename__ = "documents"
 
@@ -19,7 +20,10 @@ class Document(Base, TimestampMixin):
     original_filename: Mapped[str] = mapped_column(String(255), nullable=False)
     content_type: Mapped[str] = mapped_column(String(255), nullable=False)
     storage_path: Mapped[str] = mapped_column(String(1024), nullable=False)
-    extracted_text: Mapped[str | None] = mapped_column(Text, nullable=True)
+    size_bytes: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    openai_file_id: Mapped[str | None] = mapped_column(String(255), nullable=True)
+    openai_file_uploaded_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    openai_upload_error: Mapped[str | None] = mapped_column(String(2048), nullable=True)
     is_active: Mapped[bool] = mapped_column(Boolean, default=True, nullable=False)
 
     def __repr__(self) -> str:

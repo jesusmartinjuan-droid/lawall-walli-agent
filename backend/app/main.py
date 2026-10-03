@@ -5,17 +5,16 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 
 from app.api.routes import (
-    agent_images,
     auth,
     dashboard,
     documents,
     drafts,
+    drive_sources,
     health,
     mailboxes,
     processing,
     prompts,
     users,
-    web_sources,
 )
 from app.core.config import settings
 from app.core.logging import configure_logging, get_logger
@@ -65,8 +64,7 @@ app.include_router(users.router)
 app.include_router(mailboxes.router)
 app.include_router(prompts.router)
 app.include_router(documents.router)
-app.include_router(agent_images.router)
 app.include_router(drafts.router)
 app.include_router(processing.router)
 app.include_router(dashboard.router)
-app.include_router(web_sources.router)
+app.include_router(drive_sources.router)

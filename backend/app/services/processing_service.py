@@ -2,19 +2,21 @@
 
 `process_email` is the single entry point the Celery task calls for each new
 `EmailMessage`. It is responsible for:
-  1. Loading the active prompt and active documents.
-  2. Building the LLM context (knowledge base + thread history).
-  3. Calling the LLM and persisting the resulting `Draft` + `LLMTrace`.
-  4. Attempting to write the draft back into the mailbox.
-  5. Recording a `ProcessingLog` row per step, so the frontend can show a full
+  1. Loading the active prompt and the active knowledge files (local
+     uploads + Drive sources), already uploaded to OpenAI's Files API.
+  2. Calling the LLM (Responses API, with `code_interpreter` attached to
+     those files and `web_search` enabled) and persisting the resulting
+     `Draft` + `LLMTrace`.
+  3. Attempting to write the draft back into the mailbox.
+  4. Recording a `ProcessingLog` row per step, so the frontend can show a full
      trail, and tracking retries so a failing email is not reprocessed forever.
 
 The other public methods (`list_processing`, `get_processing_detail`) back the
 draft-history and processing-detail screens.
 """
 
-import difflib
-import json
+import base64
+from dataclasses import dataclass
 from datetime import UTC, datetime
 
 from sqlalchemy.orm import Session
@@ -22,8 +24,9 @@ from sqlalchemy.orm import Session
 from app.core.config import settings
 from app.core.encryption import decrypt_value
 from app.core.logging import get_logger
-from app.models.agent_image import AgentImage
+from app.models.document import Document
 from app.models.draft import Draft
+from app.models.drive_source import DriveSource
 from app.models.email_message import EmailMessage
 from app.models.enums import DraftStatus, ProcessingLogStatus, ProcessingStatus, ProcessingStep
 from app.models.llm_trace import LLMTrace
@@ -36,17 +39,15 @@ from app.repositories.processing_log_repository import ProcessingLogRepository
 from app.schemas.processing import (
     ProcessingDetail,
     ProcessingListItem,
+    SimulatedImage,
     SimulateDraftResponse,
-    SourceCitation,
 )
-from app.services.agent_image_service import AgentImageService
 from app.services.document_service import DocumentService
-from app.services.email_provider_service import IMAGE_PLACEHOLDER, FetchedEmail, InlineImage
-from app.services.knowledge_context_service import KnowledgeContextService
+from app.services.drive_source_service import DriveSourceService
+from app.services.email_provider_service import FetchedEmail
 from app.services.llm_service import LLMProviderError, LLMService
 from app.services.mailbox_service import build_email_provider
 from app.services.prompt_service import PromptService
-from app.services.web_source_service import WebSourceService
 
 logger = get_logger(__name__)
 
@@ -54,11 +55,41 @@ logger = get_logger(__name__)
 _KNOWLEDGE_PLACEHOLDER = "{{company_documents_context}}"
 _THREAD_PLACEHOLDER = "{{email_thread_context}}"
 
+# Replaces the old knowledge-blob text: the company's documents are no
+# longer pasted into the prompt as extracted text — they travel out-of-band
+# as real files attached to the Responses API call (see `_collect_attached_
+# files`/LLMService). The placeholder still gets *something* meaningful
+# substituted in its place so staff-authored prompts that reference it don't
+# end up with an empty, unexplained gap, and the model is told explicitly
+# how to actually get at the company's knowledge.
+_FILES_ATTACHED_NOTE = (
+    "Los documentos activos de la empresa (archivos locales y de Drive) están adjuntos "
+    "directamente a este mensaje, no pegados como texto. Ábrelos y analízalos con la "
+    "herramienta de ejecución de código si necesitas datos exactos de ellos (precios, tablas, "
+    "cláusulas...). También puedes usar la búsqueda web si necesitas información pública "
+    "adicional.\n\n"
+    "IMPORTANTE: el borrador que devuelvas debe contener ÚNICAMENTE el texto final dirigido al "
+    "cliente, listo para enviarse tal cual. Nunca incluyas en el borrador ninguna nota interna, "
+    'comentario dirigido al personal, aclaración tipo "NOTA INTERNA"/"NO ENVIAR AL CLIENTE", '
+    "ni ningún metacomentario sobre lo que estás haciendo o deberías hacer — aunque algún "
+    "documento (p. ej. el Manual Maestro) incluya ese tipo de anotaciones para uso del personal "
+    "humano, son instrucciones para quien lee el manual, no texto a reproducir en la respuesta. "
+    'Si alguna de esas anotaciones requiere de verdad intervención humana (p. ej. "requiere '
+    'valoración humana"), simplemente escribe la mejor respuesta posible para el cliente con la '
+    "información disponible, sin mencionar la anotación ni la necesidad de revisión.\n\n"
+    "Si el prompt o el Manual Maestro indican insertar una imagen (por ejemplo la tabla de "
+    "precios), hazlo escribiendo en el borrador un enlace de imagen en formato Markdown "
+    '("![descripción](URL exacta)") con la URL exacta que se te indique — eso es lo único que '
+    "necesitas hacer para que la imagen aparezca de verdad en el correo. No inventes ni "
+    "modifiques esa URL."
+)
+
 
 def render_prompt_template(
     template: str, *, company_documents_context: str, email_thread_context: str
 ) -> str:
-    """Injects the knowledge base and thread history into the prompt template.
+    """Injects the "files are attached" note and thread history into the
+    prompt template.
 
     A prompt author can place `{{company_documents_context}}` /
     `{{email_thread_context}}` anywhere in the template for exact control
@@ -87,226 +118,72 @@ def _inject(template: str, placeholder: str, fallback_title: str, value: str) ->
     return f"{template}\n\n--- {fallback_title} ---\n{value}"
 
 
-_NO_IMAGE = "ninguna"
-
-_SOURCE_ATTRIBUTION_NOTE = """
-
-============================================================
-NOTA SOLO PARA ESTA PRUEBA (no forma parte del prompt real; nunca la apliques a un correo de verdad)
-============================================================
-
-Además del borrador, debes devolver, por cada afirmación concreta que se apoye en una fuente, el \
-nombre exacto de esa fuente (tal y como aparece precedido de "###" entre las fuentes vigentes) y un \
-fragmento literal, textual, de una o dos frases, copiado tal cual de esa fuente — nunca lo \
-parafrasees ni lo inventes. Si no te has apoyado en ninguna fuente concreta, deja esa lista vacía.
-"""
-
-_DRAFT_FIELD_SCHEMA = {
-    "type": "string",
-    "description": (
-        "El borrador de respuesta para el cliente, exactamente como se entregaría. Si "
-        '`image_name` no es "ninguna": (1) NO escribas de nuevo en texto los datos que esa '
-        "imagen ya muestra (p. ej. un desglose de precios por m²) — mostrar la imagen ya "
-        "cumple cualquier obligación de incluir ese dato, no hace falta repetirlo; (2) inserta "
-        f'el marcador literal "{IMAGE_PLACEHOLDER}" en el punto exacto del texto donde debe '
-        "aparecer la imagen — normalmente justo después de la frase que la menciona, y SIEMPRE "
-        "antes de la despedida/firma final, para que la imagen no quede colgada al final del "
-        f'correo tras el saludo de cierre. No incluyas "{IMAGE_PLACEHOLDER}" si `image_name` es '
-        '"ninguna".'
-    ),
-}
-
-_CITATIONS_FIELD_SCHEMA = {
-    "type": "array",
-    "description": "Fuentes concretas usadas para fundamentar el borrador, con su cita literal.",
-    "items": {
-        "type": "object",
-        "properties": {
-            "source": {
-                "type": "string",
-                "description": 'Nombre exacto de la fuente, tal y como aparece precedido de "###".',
-            },
-            "excerpt": {
-                "type": "string",
-                "description": "Fragmento literal, copiado tal cual de esa fuente.",
-            },
-        },
-        "required": ["source", "excerpt"],
-        "additionalProperties": False,
-    },
-}
+class KnowledgeFileLimitExceededError(Exception):
+    pass
 
 
-def _build_draft_schema(image_schema_property: dict) -> dict:
-    """The structured-output schema for real draft generation: which
-    configured image (if any) to attach, plus the draft text. Deciding
-    `image_name` FIRST (schema property order) lets the model condition the
-    draft text on that decision — e.g. skip repeating a price breakdown in
-    text once it has already committed to attaching the image that shows it
-    — rather than writing the draft and only separately, disconnectedly,
-    deciding on an image afterward. The `image_name` enum comes from
-    whatever images staff currently have set up — see
-    `_build_agent_image_selection` — so this is never a fixed constant."""
-    return {
-        "type": "object",
-        "properties": {
-            "image_name": image_schema_property,
-            "draft": _DRAFT_FIELD_SCHEMA,
-        },
-        "required": ["image_name", "draft"],
-        "additionalProperties": False,
-    }
+@dataclass
+class AttachedFile:
+    name: str
+    openai_file_id: str
 
 
-def _build_simulator_schema(image_schema_property: dict) -> dict:
-    """The Simulador's structured-output schema: same image-selection as
-    real generation, plus the source citations behind the draft — richer
-    than `_build_draft_schema` since the Simulador is also where staff
-    verify *why* the agent answered as it did, not just preview the email."""
-    return {
-        "type": "object",
-        "properties": {
-            "image_name": image_schema_property,
-            "draft": _DRAFT_FIELD_SCHEMA,
-            "citations": _CITATIONS_FIELD_SCHEMA,
-        },
-        "required": ["image_name", "draft", "citations"],
-        "additionalProperties": False,
-    }
+def _collect_attached_files(
+    documents: list[Document], drive_sources: list[DriveSource]
+) -> list[AttachedFile]:
+    """Active files missing an openai_file_id (upload still pending or
+    failed) are skipped — never silently proceeded with a broken file_id —
+    and logged so staff can see it in the Documentos screen's own per-item
+    error state; this function only decides *attachment*, not whether that's
+    worth failing the whole generation over (callers enforce the count/size
+    caps on the result)."""
+    attached: list[AttachedFile] = []
+    for doc in documents:
+        if not doc.openai_file_id:
+            logger.warning("document_missing_openai_file_id id=%s", doc.id)
+            continue
+        attached.append(AttachedFile(name=doc.original_filename, openai_file_id=doc.openai_file_id))
+    for source in drive_sources:
+        if not source.openai_file_id:
+            logger.warning("drive_source_missing_openai_file_id id=%s", source.id)
+            continue
+        attached.append(AttachedFile(name=source.name, openai_file_id=source.openai_file_id))
+    return attached
 
 
-def _build_agent_image_selection(images: list[AgentImage]) -> tuple[dict, str]:
-    """Builds the JSON-schema property + system note for choosing which
-    configured image (if any) to embed in this specific reply, from the
-    images staff currently have set up. Shared by real draft generation and
-    the Simulador so both exercise identical, always-current behavior — an
-    image added, renamed or removed from the "Imágenes del agente" screen
-    takes effect on the very next email, no code change or redeploy.
-    """
-    enum_values = [image.name for image in images] + [_NO_IMAGE]
-    schema_property = {
-        "type": "string",
-        "enum": enum_values,
-        "description": (
-            'Nombre EXACTO de la imagen a adjuntar si corresponde, o "ninguna" si no aplica ninguna.'
-        ),
-    }
-    if not images:
-        return schema_property, ""
-
-    lines = "\n".join(f"- {image.name}: {image.description}" for image in images)
-    note = f"""
-
-============================================================
-IMÁGENES DISPONIBLES PARA ADJUNTAR (elige el nombre EXACTO en "image_name" si corresponde, o "{_NO_IMAGE}")
-============================================================
-{lines}
-"""
-    return schema_property, note
-
-
-def _parse_draft_with_image(raw: str) -> tuple[str, str | None]:
-    """Parses the {"image_name": ..., "draft": ...} structured output (real
-    generation) into (draft_text, chosen_image_name_or_None). Falls back to
-    (raw, None) if the response isn't valid JSON (e.g. a provider that
-    ignores `response_schema`), so a malformed response never breaks
-    generation — it just means no image gets attached."""
-    try:
-        payload = json.loads(raw)
-    except (json.JSONDecodeError, TypeError):
-        return raw.strip(), None
-    if not isinstance(payload, dict):
-        return raw.strip(), None
-
-    draft = str(payload.get("draft", raw)).strip()
-    image_name = payload.get("image_name")
-    if not image_name or image_name == _NO_IMAGE:
-        image_name = None
-    return draft, image_name
-
-
-def _parse_simulator_output(raw: str) -> tuple[str, str | None, list[SourceCitation]]:
-    """Parses the Simulador's {"image_name", "draft", "citations"}
-    structured output into (draft_text, chosen_image_name_or_None,
-    citations). Falls back to (raw, None, []) if the response isn't valid
-    JSON, so a malformed response never breaks the screen. Callers should
-    run the citations through `_filter_verified_citations` before showing
-    them — the model self-reports these, so they aren't guaranteed accurate
-    yet."""
-    try:
-        payload = json.loads(raw)
-    except (json.JSONDecodeError, TypeError):
-        return raw.strip(), None, []
-    if not isinstance(payload, dict):
-        return raw.strip(), None, []
-
-    draft = str(payload.get("draft", raw)).strip()
-
-    image_name = payload.get("image_name")
-    if not image_name or image_name == _NO_IMAGE:
-        image_name = None
-
-    raw_citations = payload.get("citations", [])
-    citations = [
-        SourceCitation(
-            source=str(c.get("source", "")).strip().lstrip("#").strip(),
-            excerpt=str(c.get("excerpt", "")).strip(),
+def _enforce_file_caps(
+    attached: list[AttachedFile], documents: list[Document], drive_sources: list[DriveSource]
+) -> None:
+    """Fails loudly rather than silently dropping files to fit — staff must
+    deactivate something in Documentos instead of Walli quietly sending an
+    incomplete knowledge base."""
+    if len(attached) > settings.max_knowledge_files_per_call:
+        raise KnowledgeFileLimitExceededError(
+            f"Hay {len(attached)} archivos activos pero el máximo permitido por llamada es "
+            f"{settings.max_knowledge_files_per_call}. Desactiva algunos archivos en Documentos."
         )
-        for c in raw_citations
-        if isinstance(c, dict) and c.get("source") and c.get("excerpt")
-    ]
-    return draft, image_name, citations
+    size_by_name = {d.original_filename: d.size_bytes for d in documents}
+    size_by_name.update({s.name: (s.size_bytes or 0) for s in drive_sources})
+    total_bytes = sum(size_by_name.get(a.name, 0) for a in attached)
+    if total_bytes > settings.max_knowledge_file_total_bytes:
+        max_mb = settings.max_knowledge_file_total_bytes // (1024 * 1024)
+        raise KnowledgeFileLimitExceededError(
+            f"El tamaño total de los archivos activos ({total_bytes // (1024 * 1024)}MB) supera "
+            f"el máximo permitido por llamada ({max_mb}MB). Desactiva algunos archivos en Documentos."
+        )
 
 
-_PUNCTUATION_EQUIVALENTS = str.maketrans(
-    {"“": '"', "”": '"', "‘": "'", "’": "'", "–": "-", "—": "-", "…": "..."}
-)
-
-# An exact-substring check rejects a citation the moment the model reworks
-# even one word while quoting (common even when explicitly told not to),
-# hiding perfectly real citations. This threshold instead asks "how much of
-# the excerpt is verbatim, in order, in the source?" — tolerant of small
-# rewording, but a mostly-invented "quote" still won't reach it.
-_MIN_CITATION_OVERLAP_RATIO = 0.85
-
-
-def _normalize_for_matching(text: str) -> str:
-    return " ".join(text.lower().translate(_PUNCTUATION_EQUIVALENTS).split())
-
-
-def _citation_overlap_ratio(excerpt: str, context: str) -> float:
-    """Fraction of `excerpt` covered by (possibly non-contiguous, in-order)
-    matching runs against `context` — 1.0 for a verbatim quote, close to 0
-    for one the source doesn't support at all."""
-    if not excerpt:
-        return 0.0
-    matcher = difflib.SequenceMatcher(None, excerpt, context, autojunk=False)
-    matched_chars = sum(block.size for block in matcher.get_matching_blocks())
-    return matched_chars / len(excerpt)
-
-
-def _filter_verified_citations(
-    citations: list[SourceCitation], knowledge_context: str
-) -> list[SourceCitation]:
-    """Keeps only the citations whose excerpt is substantially verbatim in
-    the knowledge context sent to the model. A hallucinated or largely
-    invented "quote" is dropped rather than shown to staff as if it were
-    reliable — better to show fewer citations than a wrong one."""
-    normalized_context = _normalize_for_matching(knowledge_context)
-    kept = []
-    for citation in citations:
-        normalized_excerpt = _normalize_for_matching(citation.excerpt)
-        ratio = _citation_overlap_ratio(normalized_excerpt, normalized_context)
-        if ratio >= _MIN_CITATION_OVERLAP_RATIO:
-            kept.append(citation)
-        else:
-            logger.info(
-                "simulator_citation_dropped source=%r overlap_ratio=%.2f excerpt=%r",
-                citation.source,
-                ratio,
-                citation.excerpt,
-            )
-    return kept
+def _derive_sources_used(
+    attached: list[AttachedFile], code_snippets: list[str], web_search_queries: list[str]
+) -> list[str]:
+    """ "What did the model actually consult?" — scans every
+    code_interpreter_call's literal Python for each attached file's name
+    (rather than asking the model to self-report), plus every web search it
+    ran. A file is counted once even if referenced multiple times."""
+    combined_code = "\n".join(code_snippets)
+    sources = [a.name for a in attached if a.name and a.name in combined_code]
+    sources.extend(f"Búsqueda web: {query}" for query in web_search_queries if query)
+    return sources
 
 
 class ProcessingService:
@@ -320,9 +197,7 @@ class ProcessingService:
         self.llm_traces = LLMTraceRepository(db)
         self.prompt_service = PromptService(db)
         self.document_service = DocumentService(db)
-        self.web_source_service = WebSourceService(db)
-        self.agent_image_service = AgentImageService(db)
-        self.knowledge_context_service = KnowledgeContextService()
+        self.drive_source_service = DriveSourceService(db)
         self.llm_service = LLMService()
 
     # --- Worker entry point ----------------------------------------------
@@ -410,48 +285,46 @@ class ProcessingService:
     def simulate_draft(self, email_body: str) -> SimulateDraftResponse:
         """Generate a draft for an ad-hoc email without touching the database —
         used by the "Simulador" screen so staff can try the agent against the
-        current prompt/knowledge base without a real mailbox or email."""
+        current prompt/knowledge files without a real mailbox or email."""
         prompt = self.prompt_service.get_active_prompt()
         prompt_content = prompt.content if prompt else PromptService.default_prompt_content()
 
         documents = self.document_service.list_active_documents()
-        web_sources = self.web_source_service.list_active_web_sources()
-        knowledge_context = self.knowledge_context_service.build_context(
-            documents, web_sources, query=email_body
-        )
+        drive_sources = self.drive_source_service.list_active_drive_sources()
+        attached = _collect_attached_files(documents, drive_sources)
+        _enforce_file_caps(attached, documents, drive_sources)
 
         rendered_prompt = render_prompt_template(
             prompt_content,
-            company_documents_context=knowledge_context,
+            company_documents_context=_FILES_ATTACHED_NOTE,
             email_thread_context="(Prueba de simulación, sin historial previo.)",
         )
-        rendered_prompt += _SOURCE_ATTRIBUTION_NOTE
-
-        agent_images = self.agent_image_service.list_all() if settings.enable_agent_image_embedding else []
-        image_schema_property, image_note = _build_agent_image_selection(agent_images)
-        rendered_prompt += image_note
-        response_schema = _build_simulator_schema(image_schema_property)
 
         llm_response = self.llm_service.generate_draft(
-            system_prompt=rendered_prompt,
-            user_prompt=email_body,
+            instructions=rendered_prompt,
+            input_text=email_body,
             trace_name="walli-draft-simulation",
-            response_schema=response_schema,
+            file_ids=[a.openai_file_id for a in attached],
         )
 
-        generated_body, chosen_image_name, sources_used = _parse_simulator_output(llm_response.content)
-        sources_used = _filter_verified_citations(sources_used, knowledge_context)
-        attached_image = (
-            self.agent_image_service.get_by_name(chosen_image_name) if chosen_image_name else None
+        sources_used = _derive_sources_used(
+            attached, llm_response.code_interpreter_snippets, llm_response.web_search_queries
         )
+        generated_images = [
+            SimulatedImage(
+                filename=image.filename,
+                content_type=image.content_type,
+                data_base64=base64.b64encode(image.content).decode("ascii"),
+            )
+            for image in llm_response.generated_images
+        ]
 
         return SimulateDraftResponse(
-            generated_body=generated_body,
+            generated_body=llm_response.content,
             llm_provider=llm_response.provider,
             llm_model=llm_response.model,
             sources_used=sources_used,
-            attached_image_id=attached_image.id if attached_image else None,
-            attached_image_name=attached_image.name if attached_image else None,
+            generated_images=generated_images,
         )
 
     def _generate_and_store_draft(self, *, mailbox, email_message: EmailMessage, retry_count: int) -> Draft:
@@ -467,49 +340,44 @@ class ProcessingService:
         )
 
         documents = self.document_service.list_active_documents()
-        web_sources = self.web_source_service.list_active_web_sources()
+        drive_sources = self.drive_source_service.list_active_drive_sources()
+        attached = _collect_attached_files(documents, drive_sources)
+        try:
+            _enforce_file_caps(attached, documents, drive_sources)
+        except KnowledgeFileLimitExceededError as exc:
+            self._log(
+                mailbox_id=mailbox.id,
+                email_message_id=email_message.id,
+                draft_id=None,
+                status=ProcessingLogStatus.FAILED,
+                step=ProcessingStep.ATTACH_FILES,
+                error_message=str(exc),
+                retry_count=retry_count,
+            )
+            raise
         self._log(
             mailbox_id=mailbox.id,
             email_message_id=email_message.id,
             draft_id=None,
             status=ProcessingLogStatus.SUCCESS,
-            step=ProcessingStep.LOAD_DOCUMENTS,
+            step=ProcessingStep.ATTACH_FILES,
             retry_count=retry_count,
         )
 
-        knowledge_context = self.knowledge_context_service.build_context(
-            documents, web_sources, query=email_message.body_text
-        )
         thread_context = self._build_thread_context(email_message)
-        self._log(
-            mailbox_id=mailbox.id,
-            email_message_id=email_message.id,
-            draft_id=None,
-            status=ProcessingLogStatus.SUCCESS,
-            step=ProcessingStep.BUILD_CONTEXT,
-            retry_count=retry_count,
-        )
-
         email_body = email_message.body_text or email_message.body_html or "(Correo sin contenido de texto.)"
         rendered_prompt = render_prompt_template(
             prompt_content,
-            company_documents_context=knowledge_context,
+            company_documents_context=_FILES_ATTACHED_NOTE,
             email_thread_context=thread_context,
         )
 
-        response_schema = None
-        if settings.enable_agent_image_embedding:
-            agent_images = self.agent_image_service.list_all()
-            image_schema_property, image_note = _build_agent_image_selection(agent_images)
-            rendered_prompt += image_note
-            response_schema = _build_draft_schema(image_schema_property)
-
         try:
             llm_response = self.llm_service.generate_draft(
-                system_prompt=rendered_prompt,
-                user_prompt=email_body,
+                instructions=rendered_prompt,
+                input_text=email_body,
                 trace_name=f"walli-draft-email-{email_message.id}",
-                response_schema=response_schema,
+                file_ids=[a.openai_file_id for a in attached],
             )
         except LLMProviderError:
             self._log(
@@ -532,25 +400,11 @@ class ProcessingService:
             retry_count=retry_count,
         )
 
-        generated_body = llm_response.content
-        attached_image = None
-        if response_schema is not None:
-            generated_body, chosen_image_name = _parse_draft_with_image(llm_response.content)
-            if chosen_image_name:
-                attached_image = self.agent_image_service.get_by_name(chosen_image_name)
-                if attached_image is None:
-                    logger.warning(
-                        "agent_image_chosen_but_not_found email_id=%s name=%r",
-                        email_message.id,
-                        chosen_image_name,
-                    )
-
         draft = Draft(
             mailbox_id=mailbox.id,
             email_message_id=email_message.id,
             prompt_template_id=prompt.id if prompt else None,
-            agent_image_id=attached_image.id if attached_image else None,
-            generated_body=generated_body,
+            generated_body=llm_response.content,
             rendered_prompt=rendered_prompt,
             llm_provider=llm_response.provider,
             llm_model=llm_response.model,
@@ -608,7 +462,6 @@ class ProcessingService:
                 subject=email_message.subject,
                 body=draft.generated_body,
                 in_reply_to=in_reply_to,
-                inline_image=self._load_inline_image(draft),
             )
 
             if result.success:
@@ -645,25 +498,6 @@ class ProcessingService:
                 retry_count=retry_count,
             )
             logger.error("create_draft_in_mailbox_failed email_id=%s error=%s", email_message.id, exc)
-
-    def _load_inline_image(self, draft: Draft) -> InlineImage | None:
-        if draft.agent_image_id is None:
-            return None
-        image = self.agent_image_service.get(draft.agent_image_id)
-        if image is None:
-            # Staff deleted the image between generation and this point —
-            # degrade gracefully to no image rather than failing the draft.
-            logger.warning(
-                "agent_image_missing_at_send_time draft_id=%s agent_image_id=%s",
-                draft.id,
-                draft.agent_image_id,
-            )
-            return None
-        return InlineImage(
-            content=self.agent_image_service.read_bytes(image),
-            content_type=image.content_type,
-            filename=image.original_filename,
-        )
 
     def _list_previous_thread_messages(self, email_message: EmailMessage) -> list[EmailMessage]:
         if email_message.thread_id is None:
@@ -763,14 +597,14 @@ class ProcessingService:
         documents_used: list[str] = []
         web_sources_used: list[str] = []
         # The prompt actually sent to the LLM (placeholders already substituted
-        # with the real knowledge context/email/thread at generation time), not
-        # the raw template, so this reflects exactly what the model saw.
+        # with the real thread history at generation time), not the raw
+        # template, so this reflects exactly what the model saw.
         prompt_content_snapshot = draft.rendered_prompt if draft else None
         if draft:
             active_documents = self.document_service.list_active_documents()
             documents_used = [d.original_filename for d in active_documents]
-            active_web_sources = self.web_source_service.list_active_web_sources()
-            web_sources_used = [w.name for w in active_web_sources]
+            active_drive_sources = self.drive_source_service.list_active_drive_sources()
+            web_sources_used = [s.name for s in active_drive_sources]
 
         return ProcessingDetail(
             email_message_id=message.id,

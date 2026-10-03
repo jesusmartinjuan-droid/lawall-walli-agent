@@ -1,17 +1,17 @@
 """LLM abstraction layer.
 
 The rest of the app depends only on `LLMService` / `LLMProvider`, never on a
-concrete SDK (e.g. `openai`) directly. Swapping providers (Anthropic, local
-models, etc.) means adding a new `LLMProvider` implementation and wiring it
-into `get_llm_provider()` — no changes needed in processing_service.py.
+concrete SDK (e.g. `openai`) directly. The real provider calls OpenAI's
+Responses API with `code_interpreter` (reading the active knowledge files
+directly — no text extraction) and `web_search` (live web lookups) — no
+structured JSON output anywhere in this pipeline anymore.
 """
 
 from __future__ import annotations
 
-import json
 import time
 from abc import ABC, abstractmethod
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 
 from app.core.config import settings
 from app.core.logging import get_logger
@@ -19,6 +19,13 @@ from app.core.retry import with_retry
 from app.services import langfuse_client
 
 logger = get_logger(__name__)
+
+
+@dataclass
+class GeneratedImage:
+    filename: str
+    content_type: str
+    content: bytes
 
 
 @dataclass
@@ -31,7 +38,19 @@ class LLMResponse:
     latency_ms: int
     estimated_cost: float | None = None
     langfuse_trace_id: str | None = None
-    cached_tokens: int | None = None
+    # The literal Python code the model actually ran via code_interpreter,
+    # one entry per code_interpreter_call in response.output — scanned by
+    # ProcessingService for attached filenames to derive "sources actually
+    # consulted" (grounded citations), see processing_service.py.
+    code_interpreter_snippets: list[str] = field(default_factory=list)
+    # The query/URL of each web_search_call the model made, for the same
+    # "what did it actually consult" derivation.
+    web_search_queries: list[str] = field(default_factory=list)
+    # Any image file the model's code_interpreter code produced or displayed
+    # during this call — a freshly rendered chart, or an existing uploaded
+    # image it chose to show as-is. Real bytes, downloaded from the sandbox
+    # container (see `_extract_generated_images`).
+    generated_images: list[GeneratedImage] = field(default_factory=list)
 
 
 class LLMProviderError(Exception):
@@ -43,16 +62,15 @@ class LLMProvider(ABC):
 
     @abstractmethod
     def generate(
-        self, *, system_prompt: str, user_prompt: str, response_schema: dict | None = None
+        self, *, instructions: str, input_text: str, file_ids: list[str] | None = None
     ) -> LLMResponse: ...
 
 
 class OpenAILLMProvider(LLMProvider):
     name = "openai"
 
-    def __init__(self, api_key: str, model: str, temperature: float, max_tokens: int):
+    def __init__(self, api_key: str, model: str, max_tokens: int):
         self.model = model
-        self.temperature = temperature
         self.max_tokens = max_tokens
         self._api_key = api_key
 
@@ -62,89 +80,122 @@ class OpenAILLMProvider(LLMProvider):
         return OpenAI(api_key=self._api_key)
 
     def generate(
-        self, *, system_prompt: str, user_prompt: str, response_schema: dict | None = None
+        self, *, instructions: str, input_text: str, file_ids: list[str] | None = None
     ) -> LLMResponse:
+        file_ids = file_ids or []
+
         def _call():
             client = self._client()
-            kwargs = {}
-            if response_schema is not None:
-                kwargs["response_format"] = {
-                    "type": "json_schema",
-                    "json_schema": {
-                        "name": "walli_structured_output",
-                        "schema": response_schema,
-                        "strict": True,
-                    },
-                }
-            return client.chat.completions.create(
+            tools: list[dict] = [{"type": "web_search"}]
+            if file_ids:
+                tools.append(
+                    {"type": "code_interpreter", "container": {"type": "auto", "file_ids": file_ids}}
+                )
+            # No `temperature`: gpt-5.6-sol (and the rest of this reasoning-tier
+            # family) rejects it outright ("Unsupported parameter") — confirmed
+            # against the real API, not an assumption.
+            return client.responses.create(
                 model=self.model,
-                temperature=self.temperature,
-                max_completion_tokens=self.max_tokens,
-                messages=[
-                    {"role": "system", "content": system_prompt},
-                    {"role": "user", "content": user_prompt},
-                ],
-                **kwargs,
+                max_output_tokens=self.max_tokens,
+                instructions=instructions,
+                input=input_text,
+                tools=tools,
             )
 
         started = time.monotonic()
-        completion = with_retry(_call, exceptions=(Exception,))
+        response = with_retry(_call, exceptions=(Exception,))
         latency_ms = int((time.monotonic() - started) * 1000)
 
-        choice = completion.choices[0]
-        usage = completion.usage
-        prompt_tokens = getattr(usage, "prompt_tokens", None)
-        cached_tokens = getattr(getattr(usage, "prompt_tokens_details", None), "cached_tokens", None)
-
-        if prompt_tokens:
-            logger.info(
-                "openai_prompt_cache model=%s prompt_tokens=%s cached_tokens=%s",
+        if not response.output_text and getattr(response, "status", None) == "incomplete":
+            logger.warning(
+                "openai_response_incomplete model=%s reason=%s max_output_tokens=%s",
                 self.model,
-                prompt_tokens,
-                cached_tokens or 0,
+                getattr(getattr(response, "incomplete_details", None), "reason", None),
+                self.max_tokens,
             )
 
+        usage = response.usage
+        code_snippets = [
+            item.code
+            for item in response.output
+            if getattr(item, "type", None) == "code_interpreter_call" and item.code
+        ]
+        web_search_queries = [
+            query
+            for item in response.output
+            if getattr(item, "type", None) == "web_search_call"
+            and (query := _describe_web_search_action(getattr(item, "action", None)))
+        ]
+        container_ids = {
+            item.container_id
+            for item in response.output
+            if getattr(item, "type", None) == "code_interpreter_call" and getattr(item, "container_id", None)
+        }
+        generated_images = (
+            _extract_generated_images(self._client(), container_ids, file_ids) if container_ids else []
+        )
+
         return LLMResponse(
-            content=choice.message.content or "",
+            content=response.output_text or "",
             provider=self.name,
             model=self.model,
-            input_tokens=prompt_tokens,
-            output_tokens=getattr(usage, "completion_tokens", None),
+            input_tokens=getattr(usage, "input_tokens", None),
+            output_tokens=getattr(usage, "output_tokens", None),
             latency_ms=latency_ms,
-            cached_tokens=cached_tokens,
+            code_interpreter_snippets=code_snippets,
+            web_search_queries=web_search_queries,
+            generated_images=generated_images,
         )
 
 
-def _mock_structured_stub(schema: dict, draft_text: str) -> dict:
-    """Builds a minimal, schema-shaped JSON object for MockLLMProvider,
-    generically from `response_schema["properties"]`, so any structured
-    output shape (present or future) works locally without an API key and
-    without hardcoding a stub per schema here. The "draft" string property,
-    if present, gets the canned draft text; everything else gets a
-    conservative empty/default value (preferring an explicit "none" enum
-    member when the schema declares one, since that's the safe "nothing to
-    do" choice for the kind of yes/no/which-option fields these schemas add
-    alongside "draft")."""
-    properties = schema.get("properties", {})
-    result: dict = {}
-    for name, prop_schema in properties.items():
-        if name == "draft" and prop_schema.get("type") == "string":
-            result[name] = draft_text
+_IMAGE_EXTENSIONS = (".png", ".jpg", ".jpeg", ".gif")
+
+
+def _extract_generated_images(
+    client, container_ids: set[str], input_file_ids: list[str]
+) -> list[GeneratedImage]:
+    """Downloads any image file present in a code_interpreter sandbox
+    container after the call — a chart the model rendered, or an existing
+    uploaded image it chose to display as-is. Excludes the files we
+    ourselves attached as input (their sandbox path embeds their original
+    `file_id`, e.g. `/mnt/data/file-XXXX-tabla.png`) so only what the model
+    actually produced/surfaced during this specific call is returned. Never
+    raises — a download hiccup here must never break draft generation."""
+    images: list[GeneratedImage] = []
+    for container_id in container_ids:
+        try:
+            container_files = client.containers.files.list(container_id)
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("container_files_list_failed container_id=%s error=%s", container_id, exc)
             continue
-        if "enum" in prop_schema:
-            enum_values = prop_schema["enum"]
-            result[name] = "none" if "none" in enum_values else (enum_values[0] if enum_values else "")
-        elif prop_schema.get("type") == "array":
-            result[name] = []
-        elif prop_schema.get("type") == "string":
-            result[name] = ""
-        elif prop_schema.get("type") in ("integer", "number"):
-            result[name] = 0
-        elif prop_schema.get("type") == "boolean":
-            result[name] = False
-        else:
-            result[name] = None
-    return result
+
+        for container_file in container_files.data:
+            path = getattr(container_file, "path", "") or ""
+            if not path.lower().endswith(_IMAGE_EXTENSIONS):
+                continue
+            if any(file_id in path for file_id in input_file_ids):
+                continue
+
+            try:
+                content = client.containers.files.content.retrieve(
+                    file_id=container_file.id, container_id=container_id
+                ).read()
+            except Exception as exc:  # noqa: BLE001
+                logger.warning("container_file_download_failed file_id=%s error=%s", container_file.id, exc)
+                continue
+
+            filename = path.rsplit("/", 1)[-1]
+            content_type = "image/png" if filename.lower().endswith(".png") else "image/jpeg"
+            images.append(GeneratedImage(filename=filename, content_type=content_type, content=content))
+    return images
+
+
+def _describe_web_search_action(action) -> str | None:
+    """`action` is a union of ActionSearch (.query)/ActionOpenPage (.url)/
+    ActionFind (.url, .pattern) — pick whichever identifying field it has."""
+    if action is None:
+        return None
+    return getattr(action, "query", None) or getattr(action, "url", None) or getattr(action, "pattern", None)
 
 
 class MockLLMProvider(LLMProvider):
@@ -156,22 +207,21 @@ class MockLLMProvider(LLMProvider):
     name = "mock"
 
     def generate(
-        self, *, system_prompt: str, user_prompt: str, response_schema: dict | None = None
+        self, *, instructions: str, input_text: str, file_ids: list[str] | None = None
     ) -> LLMResponse:
         started = time.monotonic()
-        draft = (
+        content = (
             "Gracias por tu mensaje. Estamos revisando tu consulta y te "
             "responderemos con la información necesaria en cuanto la tengamos "
             "disponible.\n\n[Borrador generado por el proveedor LLM 'mock': "
             "configura OPENAI_API_KEY para generar respuestas reales.]"
         )
-        content = json.dumps(_mock_structured_stub(response_schema, draft)) if response_schema else draft
         latency_ms = int((time.monotonic() - started) * 1000)
         return LLMResponse(
             content=content,
             provider=self.name,
             model="mock-1",
-            input_tokens=len(user_prompt.split()),
+            input_tokens=len(input_text.split()),
             output_tokens=len(content.split()),
             latency_ms=latency_ms,
         )
@@ -182,7 +232,6 @@ def get_llm_provider() -> LLMProvider:
         return OpenAILLMProvider(
             api_key=settings.openai_api_key,
             model=settings.openai_model,
-            temperature=settings.llm_temperature,
             max_tokens=settings.llm_max_tokens,
         )
     if settings.llm_provider != "openai":
@@ -197,23 +246,18 @@ class LLMService:
         self.provider = provider or get_llm_provider()
 
     def generate_draft(
-        self,
-        *,
-        system_prompt: str,
-        user_prompt: str,
-        trace_name: str,
-        response_schema: dict | None = None,
+        self, *, instructions: str, input_text: str, trace_name: str, file_ids: list[str] | None = None
     ) -> LLMResponse:
         try:
             response = self.provider.generate(
-                system_prompt=system_prompt, user_prompt=user_prompt, response_schema=response_schema
+                instructions=instructions, input_text=input_text, file_ids=file_ids
             )
         except Exception as exc:
             langfuse_client.record_llm_trace(
                 name=trace_name,
                 provider=self.provider.name,
                 model=getattr(self.provider, "model", "unknown"),
-                prompt=user_prompt,
+                prompt=input_text,
                 completion="",
                 input_tokens=None,
                 output_tokens=None,
@@ -226,7 +270,7 @@ class LLMService:
             name=trace_name,
             provider=response.provider,
             model=response.model,
-            prompt=user_prompt,
+            prompt=input_text,
             completion=response.content,
             input_tokens=response.input_tokens,
             output_tokens=response.output_tokens,
